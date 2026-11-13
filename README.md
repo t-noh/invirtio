@@ -32,7 +32,11 @@ scripts/invirtio-build-guest.sh
 ```
 
 The last step builds one UML guest with every supported driver, in
-`linux-uml/build-invirtio`, and its initramfs.
+`linux-uml/build-invirtio`, and its initramfs. With `-H`, it builds the
+guest with Clang and hardening against bugs in the drivers instead: shadow
+stacks, kCFI, and memory protection keys that keep the VirtIO transport's
+state out of the drivers' reach (`docs/MPK.md`). That guest goes to
+`linux-uml/build-invirtio-hardened`.
 
 ## Installing
 

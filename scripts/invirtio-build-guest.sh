@@ -24,12 +24,16 @@
 #   invirtio-gpu  the guest of GPUs that invirtio install -gpu-guest takes,
 #                 the amdgpu guest with the driver guest's init.
 #
-# usage: invirtio-build-guest.sh [-t <target>] [<build dir>]
+# usage: invirtio-build-guest.sh [-H] [-t <target>] [<build dir>]
+#
+# With -H, the guest is built with Clang and the hardening of
+# configs/hardening.config: shadow stacks (CET), kCFI and memory protection
+# keys (MPK).
 #
 # The default target is invirtio, and the default build directory is
-# linux-uml/build-<target>. The initramfs goes to
-# <build dir>/initramfs/initramfs.cpio, where invirtio install and
-# invirtio-test look.
+# linux-uml/build-<target>, or linux-uml/build-<target>-hardened with -H.
+# The initramfs goes to <build dir>/initramfs/initramfs.cpio, where invirtio
+# install and invirtio-test look.
 
 set -euo pipefail
 
@@ -41,8 +45,10 @@ SRC=$ROOT/linux-uml/linux
 CONFIGS=$ROOT/configs
 
 TARGET=invirtio
-while getopts t:h opt; do
+HARDEN=
+while getopts Ht:h opt; do
     case $opt in
+    H) HARDEN=1 ;;
     t) TARGET=$OPTARG ;;
     *) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
     esac
@@ -99,15 +105,30 @@ amdgpu | invirtio-gpu)
     ;;
 esac
 
-OUT=$(realpath -m "${1:-$ROOT/linux-uml/build-$TARGET}")
+MAKE_ARGS=(ARCH=um)
+SUFFIX=
+if [ -n "$HARDEN" ]; then
+    FRAGMENTS+=(hardening)
+    MAKE_ARGS+=(CC=clang)
+    SUFFIX=-hardened
+fi
+
+OUT=$(realpath -m "${1:-$ROOT/linux-uml/build-$TARGET$SUFFIX}")
 PATHS=()
 for f in "${FRAGMENTS[@]}"; do
     PATHS+=("$CONFIGS/$f.config")
 done
 
-make -C "$SRC" ARCH=um O="$OUT" x86_64_defconfig
+make -C "$SRC" "${MAKE_ARGS[@]}" O="$OUT" x86_64_defconfig
 (cd "$SRC" && ARCH=um scripts/kconfig/merge_config.sh -m -O "$OUT" \
     "$OUT/.config" "${PATHS[@]}")
-make -C "$SRC" ARCH=um O="$OUT" olddefconfig
-make -C "$SRC" ARCH=um O="$OUT" -j"$(nproc)"
+make -C "$SRC" "${MAKE_ARGS[@]}" O="$OUT" olddefconfig
+# An option whose dependencies the compiler does not meet drops out quietly.
+if [ -n "$HARDEN" ]; then
+    grep '^CONFIG_' "$CONFIGS/hardening.config" | while read -r line; do
+        grep -qx "$line" "$OUT/.config" ||
+            { echo "${0##*/}: $line did not take effect" >&2; exit 1; }
+    done
+fi
+make -C "$SRC" "${MAKE_ARGS[@]}" O="$OUT" -j"$(nproc)"
 "$ROOT/scripts/mkinitramfs.sh" "${INITRAMFS[@]}" "$OUT" "$OUT/initramfs"
