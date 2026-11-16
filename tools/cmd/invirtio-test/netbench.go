@@ -49,6 +49,10 @@ var netBenchJobs = []netBenchJob{
 	{bench.Job{Name: "tcp-tx-4", About: "TCP to the far end, four streams", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(false, 4), true},
 	{bench.Job{Name: "tcp-rx-1", About: "TCP from the far end, one stream", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(true, 1), true},
 	{bench.Job{Name: "tcp-rx-4", About: "TCP from the far end, four streams", Metrics: []string{"gbps", "retransmits"}}, netBenchTCP(true, 4), true},
+	{bench.Job{Name: "paced-tx-1g", About: "TCP to the far end, one stream paced at 1 Gb/s", Metrics: []string{"gbps", "retransmits"}}, netBenchPacedTCP(false, "1G"), true},
+	{bench.Job{Name: "paced-rx-1g", About: "TCP from the far end, one stream paced at 1 Gb/s", Metrics: []string{"gbps", "retransmits"}}, netBenchPacedTCP(true, "1G"), true},
+	{bench.Job{Name: "paced-tx-2.5g", About: "TCP to the far end, one stream paced at 2.5 Gb/s", Metrics: []string{"gbps", "retransmits"}}, netBenchPacedTCP(false, "2500M"), true},
+	{bench.Job{Name: "paced-rx-2.5g", About: "TCP from the far end, one stream paced at 2.5 Gb/s", Metrics: []string{"gbps", "retransmits"}}, netBenchPacedTCP(true, "2500M"), true},
 	{bench.Job{Name: "udp64-tx", About: "64-byte UDP datagrams to the far end at an unlimited rate", Metrics: []string{"sent_kpps", "received_kpps", "loss_pct"}}, netBenchUDP(false), true},
 	{bench.Job{Name: "udp64-rx", About: "64-byte UDP datagrams from the far end at an unlimited rate", Metrics: []string{"sent_kpps", "received_kpps", "loss_pct"}}, netBenchUDP(true), true},
 	{bench.Job{Name: "tcp-rr", About: "netperf TCP_RR with 1-byte messages", Metrics: []string{"tps", "mean_us", "p99_us"}}, netBenchRR("TCP_RR"), false},
@@ -249,7 +253,7 @@ Jobs:`+netBenchJobList())
 func netBenchJobList() string {
 	var b strings.Builder
 	for _, j := range netBenchJobs {
-		fmt.Fprintf(&b, "\n  %-10s %s", j.Name, j.About)
+		fmt.Fprintf(&b, "\n  %-13s %s", j.Name, j.About)
 	}
 	return b.String()
 }
@@ -575,6 +579,24 @@ func (s *netBenchSuite) iperf(ns string, args ...string) (harness.Iperf, error) 
 func netBenchTCP(reverse bool, streams int) func(*netBenchSuite, string) (map[string]float64, error) {
 	return func(s *netBenchSuite, ns string) (map[string]float64, error) {
 		args := []string{"-P", fmt.Sprint(streams)}
+		if reverse {
+			args = append(args, "-R")
+		}
+		r, err := s.iperf(ns, args...)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]float64{"gbps": r.ReceivedBPS / 1e9, "retransmits": float64(r.Retransmits)}, nil
+	}
+}
+
+// netBenchPacedTCP runs one TCP stream whose sender's socket the kernel
+// paces at rate. The kernel paces whole TSO packets, so the data still
+// leaves in bursts at line rate, but in smaller ones than iperf3's own
+// pacing timer sends.
+func netBenchPacedTCP(reverse bool, rate string) func(*netBenchSuite, string) (map[string]float64, error) {
+	return func(s *netBenchSuite, ns string) (map[string]float64, error) {
+		args := []string{"--fq-rate", rate}
 		if reverse {
 			args = append(args, "-R")
 		}
