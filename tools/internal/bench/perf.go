@@ -26,8 +26,10 @@ func StartProfile(ctx context.Context, cpus, data string, delay, limit time.Dura
 	if err != nil {
 		return nil, err
 	}
-	args := []string{"record", "-g", "-F", "999", "-o", data,
-		"-D", fmt.Sprint(delay.Milliseconds())}
+	args := []string{"record", "-g", "-F", "999", "-o", data}
+	if ms := delay.Milliseconds(); ms > 0 {
+		args = append(args, "-D", fmt.Sprint(ms))
+	}
 	if cpus == "" {
 		args = append(args, "-a")
 	} else {
