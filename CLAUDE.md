@@ -20,4 +20,5 @@ subagent to perform code review, and apply the fixes it suggests after
 verifying them. Then continue spawning review subagents until no more issues
 are found.
 
-Commits for this project are always title-only with no body.
+Commits for this project are always title-only with no body, and maximum of 50
+characters in the title.
