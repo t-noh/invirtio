@@ -13,6 +13,7 @@ import (
 
 	"invirtio/internal/command"
 	"invirtio/internal/pci"
+	"invirtio/internal/record"
 	"invirtio/internal/sysfs"
 	"invirtio/internal/vdpa"
 )
@@ -23,7 +24,7 @@ import (
 func cmdDisplay(args []string) error {
 	fs := flag.NewFlagSet("display", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: invirtio display on|off <name>\n\nSwitch the display manager to the guest of a GPU until the next boot, or\nback to the GPU's host driver. Enable and disable run this.")
+		fmt.Fprintln(os.Stderr, "usage: invirtio display on|off <name>\n\nSwitch the display manager to the guest of a GPU, or back to the GPU's\nhost driver. Enable and disable run this.")
 	}
 	fs.Parse(args)
 	if fs.NArg() != 2 || (fs.Arg(0) != "on" && fs.Arg(0) != "off") {
@@ -32,11 +33,7 @@ func cmdDisplay(args []string) error {
 	}
 	requireRoot()
 	name := fs.Arg(1)
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	dev, err := cfg.device(name)
+	dev, err := record.Load(name)
 	if err != nil {
 		return err
 	}
@@ -53,20 +50,24 @@ func cmdDisplay(args []string) error {
 	return displayOff(name, dev, dm)
 }
 
-// displayOn stops the display manager, makes it bind to the guest's service
-// and graphical sessions take the device's Mesa, and starts it again, which
-// starts the guest first. If the display manager does not start, everything
-// goes back to the GPU's host driver.
-func displayOn(name string, dev *Device, dm string) error {
+// displayOn stops the display manager, starts the guest, makes the display
+// manager bind to the guest's service and graphical sessions take the
+// device's Mesa, and starts the display manager again. If the display
+// manager does not start, everything goes back to the GPU's host driver.
+func displayOn(name string, dev *record.Device, dm string) error {
 	logf("stopping %s", dm)
 	if err := command.Run("systemctl", "stop", dm); err != nil {
 		return err
 	}
-	if err := writeDisplayFiles(name, dev, dm); err != nil {
-		return displayBack(name, dev, dm, err)
-	}
 	if bind := fbconBind(); bind != "" {
 		sysfs.Write(bind, "0\n")
+	}
+	logf("starting the guest of %s", name)
+	if err := command.Run("systemd-run", startArgs(name, dev.Type)...); err != nil {
+		return displayBack(name, dev, dm, err)
+	}
+	if err := writeDisplayFiles(name, dev, dm); err != nil {
+		return displayBack(name, dev, dm, err)
 	}
 	logf("starting %s on %s", dm, name)
 	if err := command.Run("systemctl", "start", dm); err != nil {
@@ -77,9 +78,9 @@ func displayOn(name string, dev *Device, dm string) error {
 
 // displayOff switches a display manager that runs on the guest back to the
 // GPU's host driver. A display manager that was not switched is left alone.
-func displayOff(name string, dev *Device, dm string) error {
+func displayOff(name string, dev *record.Device, dm string) error {
 	if _, err := os.Stat(dmDropinPath(dm, name)); err != nil &&
-		systemctlState("is-active", "invirtio@"+name+".service") != "active" {
+		systemctlState("is-active", record.Unit(name)) != "active" {
 		logf("%s does not run on %s", dm, name)
 		return nil
 	}
@@ -93,7 +94,7 @@ func displayOff(name string, dev *Device, dm string) error {
 // displayBack stops the guest, removes what switched the display manager,
 // returns the GPU to its host driver and starts the display manager there.
 // It returns cause, or the first error of its own.
-func displayBack(name string, dev *Device, dm string, cause error) error {
+func displayBack(name string, dev *record.Device, dm string, cause error) error {
 	if cause != nil {
 		warn("switching %s back to the host's driver: %v", dm, cause)
 	}
@@ -102,7 +103,7 @@ func displayBack(name string, dev *Device, dm string, cause error) error {
 			cause = err
 		}
 	}
-	keep(command.Run("systemctl", "stop", "invirtio@"+name+".service"))
+	keep(unitAction(record.Unit(name), "stop").run())
 	// A guest that exited by itself leaves its device on the bus, which
 	// goes once the display manager and its clients have let go of it.
 	if vdpa.Exists(name) {
@@ -119,20 +120,16 @@ func displayBack(name string, dev *Device, dm string, cause error) error {
 }
 
 // writeDisplayFiles writes the files that switch the display manager to the
-// guest until the next boot. The display manager binds to the guest's
-// service, which is ready once virtio_gpu has registered the guest's DRM
-// card and does not restart, and graphical sessions take the device's Mesa.
-// A start or a stop of the guest's service can wait a minute for processes to
-// let go of a device, besides the waits of a plain start or stop.
-func writeDisplayFiles(name string, dev *Device, dm string) error {
-	unit := "invirtio@" + name + ".service"
+// guest. The display manager binds to the guest's service, and graphical
+// sessions take the device's Mesa.
+func writeDisplayFiles(name string, dev *record.Device, dm string) error {
+	unit := record.Unit(name)
 	files := map[string]string{
 		runEnvPath: "LD_LIBRARY_PATH=" + dev.Mesa + "/lib\n" +
 			"VK_DRIVER_FILES=" + dev.Mesa + "/share/vulkan/icd.d/radeon_icd.x86_64.json\n" +
 			"__EGL_VENDOR_LIBRARY_FILENAMES=" + dev.Mesa + "/share/glvnd/egl_vendor.d/50_mesa.json\n" +
 			"GBM_BACKENDS_PATH=" + dev.Mesa + "/lib/gbm\n",
 		dmDropinPath(dm, name): "[Unit]\nBindsTo=" + unit + "\nAfter=" + unit + "\n",
-		guestDropinPath(name):  "[Service]\nType=notify\nNotifyAccess=main\nTimeoutStartSec=240\nTimeoutStopSec=240\nRestart=no\n",
 	}
 	for path, content := range files {
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -146,7 +143,7 @@ func writeDisplayFiles(name string, dev *Device, dm string) error {
 }
 
 func removeDisplayFiles(name, dm string) error {
-	for _, path := range []string{runEnvPath, dmDropinPath(dm, name), guestDropinPath(name)} {
+	for _, path := range []string{runEnvPath, dmDropinPath(dm, name)} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -292,14 +289,15 @@ func owner(st os.FileInfo) uint32 {
 	return ^uint32(0)
 }
 
-func romPath(name string) string { return filepath.Join(configDir, name+".rom") }
-
 func dmDropinPath(dm, name string) string {
 	return filepath.Join(runUnitDir, dm+".d", "50-invirtio-"+name+".conf")
 }
 
-func guestDropinPath(name string) string {
-	return filepath.Join(runUnitDir, "invirtio@"+name+".service.d", "50-display.conf")
+// displaySwitched reports whether a display manager binds to a device's
+// guest.
+func displaySwitched(name string) bool {
+	m, _ := filepath.Glob(filepath.Join(runUnitDir, "*.d", "50-invirtio-"+name+".conf"))
+	return len(m) > 0
 }
 
 // displayAction runs invirtio display in a transient unit and waits for it,

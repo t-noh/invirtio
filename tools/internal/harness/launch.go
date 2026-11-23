@@ -27,11 +27,6 @@ type Launch struct {
 	Devices []string
 	// Args are added to the guest's command line.
 	Args []string
-	// Cgroup is the cgroup that the guest runs in, or "".
-	Cgroup string
-	// IRQCPUs are the host CPUs that the devices' host interrupts are
-	// steered to, and that the launcher runs on, or "".
-	IRQCPUs string
 }
 
 // MakeLogDir makes a directory on a tmpfs for in-flight logs.
@@ -47,14 +42,8 @@ func LaunchGuest(path string, l Launch) (*Guest, error) {
 		"-l", "1024", "-i", filepath.Join(l.Build, "initramfs/initramfs.cpio"),
 		"-e", fmt.Sprintf("%s,%s,log=%s", l.Type, l.Name, filepath.Join(l.LogDir, "inflight")),
 	}
-	if l.Cgroup != "" {
-		argv = append(argv, "-g", l.Cgroup)
-	}
 	if len(l.Devices) > 0 {
 		argv = append(argv, "-b")
-	}
-	if l.IRQCPUs != "" {
-		argv = append(argv, "-a", l.IRQCPUs)
 	}
 	for _, d := range l.Devices {
 		argv = append(argv, "-d", d)
@@ -65,9 +54,6 @@ func LaunchGuest(path string, l Launch) (*Guest, error) {
 	}
 	argv = append(argv, filepath.Join(l.Build, "linux"), device)
 	argv = append(argv, l.Args...)
-	if l.IRQCPUs != "" {
-		argv = append([]string{"taskset", "-c", l.IRQCPUs}, argv...)
-	}
 	return StartGuest(path, argv...)
 }
 

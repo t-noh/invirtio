@@ -16,17 +16,15 @@ import (
 
 	"invirtio/internal/bench"
 	"invirtio/internal/harness"
-	"invirtio/internal/pci"
-	"invirtio/internal/vdpa"
 )
 
 func init() {
 	register("bench-net", "benchmark the VDUSE virtio-net backend against the host's i40e", cmdBenchNet)
 	register("bench-net-summary", "print the results of bench-net again", cmdBenchNetSummary)
+	register("bench-perf-report", "write the reports of the perf profiles of a bench-net run", cmdBenchPerfReport)
 }
 
 const (
-	netBenchName = "vnet-bench"
 	// The namespace of the tested interface, on the host's i40e or
 	// virtio_net.
 	netBenchNS  = "vnet-bench"
@@ -63,30 +61,22 @@ var netBenchJobs = []netBenchJob{
 
 type netBenchSuite struct {
 	out string
-	mem string
-	// guestArgs are added to the guest's command line, and guestSetup
-	// runs in its shell once it boots.
-	guestArgs  []string
-	guestSetup string
 	// perfJob selects the jobs that are profiled, or is "". Their
-	// profiles are reported once the guests are gone.
+	// profiles are reported at the end of a native run.
 	perfJob  string
 	profiles []*bench.Profile
-	build    string
 	mtu      int
 	seconds  int
 	omit     int
 	opts     *bench.Options
 	jobs     []netBenchJob
 	far      *netFarEnd
-	// portDriver is port 0's driver before the run, which it restores.
-	portDriver string
-	results    bench.Results
-	// The guest of the guest target and its cgroup, whose CPU use and
-	// memory are measured.
-	guest  *harness.Guest
-	cgroup string
-	memory *harness.GuestMemory
+	results  bench.Results
+	// enabled is port 0's guest for the guest target. guest is set to it
+	// while the target runs, and its CPU use and memory are measured.
+	enabled *harness.Enabled
+	guest   *harness.Enabled
+	memory  *harness.GuestMemory
 	// ctx ends on a signal, which stops a running job, and the target that
 	// runs then fails and cleans up.
 	ctx context.Context
@@ -106,79 +96,103 @@ is one of:
              the cores of -app-cpus and -peer-cpus
   native-1q  the same with one queue pair, as the guest's i40e has, and its
              interrupts on the device CPU
-  guest      port 0 driven by the invirtio guest under the launcher through
-             VFIO and exported to the host's virtio_net
+  guest      port 0 driven by the guest that invirtio enable started, and
+             exported to the host's virtio_net
 
 Each target's interface is in the namespace vnet-bench, where the jobs run.
 
-The default runs all three. Each round brings up every target once and runs
-its jobs -reps times, and every other round runs the targets in the reverse
-order. Both ports have an MTU of -mtu. Each throughput job runs for -time
-seconds after -omit seconds that it leaves out.
+The default is guest if port 0 is enabled, and both native targets
+otherwise. The benchmark never changes port 0's driver, so a run has either
+the guest target, for which port 0 must be enabled, or native targets, for
+which it must be disabled and on i40e. Each round brings up every target
+once and runs its jobs -reps times, and every other round runs the targets
+in the reverse order. Both ports have an MTU of -mtu, and the guest's
+backend takes one up to its mtu= option, which enable's -options sets. Each
+throughput job runs for -time seconds after -omit seconds that it leaves
+out.
 
 The benchmark's programs run on -app-cpus, and the far end's programs and
 port 1's interrupts on -peer-cpus. With native-1q and the guest, the
-device's interrupts go to -device-cpu, as do the guest's CPU, its helper
-threads and its VDUSE interrupts. Each run records how many of the host's
-CPUs were busy and how many of each set's, and with the guest, how many
-CPUs the guest's cgroup took, how busy the guest's own CPU was, and how
-many DMA buffers it mapped each second. During the run, every CPU uses the
-performance governor, boost is as -boost says, and irqbalance is stopped.
-A summary's values are means over the rounds, since each round brings a
-target up again. -guest-args adds to the guest's command line, so that
-vfio_uml.eager_dma=1 maps all of its RAM for DMA once.
+device's interrupts go to -device-cpu, as do the guest's VDUSE interrupts,
+and the guest must be pinned there, which enable's -irq-cpus and -args
+cpu_pin= do. Each run records how many of the host's CPUs were busy and how
+many of each set's, and with the guest, how many CPUs the guest's cgroup
+took, how busy the guest's own CPU was, and how many DMA buffers it mapped
+each second. During the run, every CPU uses the performance governor,
+boost is as -boost says, and irqbalance is stopped. A summary's values are
+means over the rounds.
 
-The guest runs with -mem in a cgroup of its own, as invirtio's guests do,
-and the results record the cgroup's peak memory and the most memory that
-the guest itself used between jobs. Build the guest with
-scripts/invirtio-build-guest.sh. -guest-setup runs shell commands in the
-guest once it boots, and fails the run if they do not finish. With -perf,
-perf records the device CPU, or every CPU without pinning, during each run
-of the matching jobs, after the omitted seconds of iperf3, into
+With the guest, the results record the device's record and the guest's
+kernel, the peak memory of the guest's cgroup since the guest started, and
+the most memory that the guest itself used between jobs. Each round's
+VDUSE and DMA counters count from the guest's start, with their values at
+the start of the round under start_. With -perf, perf records the device
+CPU, or every CPU without pinning, during each run of the matching jobs,
+after the omitted seconds of iperf3, into
 perf-<job>-<target>-<round>-<rep>.data in the output directory. Its
-messages go to .data.log. Once the bench ends and the guests have exited,
-which perf needs to find their symbols, reports by symbol go to .data.txt
-and by command and object to .data.dso.txt. The output directory gets
-results.json, runs.csv with one metric of one run on each line, and the
-summary, which bench-net-summary prints again. Run as root on the
-linux-host kernel, with iperf3, netperf and ethtool, and perf for -perf.
+messages go to .data.log. Reports by symbol go to .data.txt and by command
+and object to .data.dso.txt, at the end of a native run, and for the
+guest, which perf needs to have exited to find its symbols, with
+bench-perf-report once the device is disabled. The output
+directory gets results.json, runs.csv with one metric of one run on each
+line, and the summary, which bench-net-summary prints again. Run as root
+on the linux-host kernel, with iperf3, netperf and ethtool, and perf for
+-perf.
 
 Jobs:`+netBenchJobList())
-	build := fs.String("guest", filepath.Join(root, "linux-uml/build-invirtio"), "the build directory of the guest")
 	out := fs.String("out", filepath.Join(root, "build/bench-net"), "the output directory")
 	seconds := fs.Int("time", 10, "the seconds that each throughput job measures")
 	omit := fs.Int("omit", 2, "the seconds at the start of each iperf3 run that it leaves out")
 	mtu := fs.Int("mtu", 1500, "the MTU of both ports")
-	mem := fs.String("mem", "256M", "the guest's memory, as UML's mem= takes it")
-	guestArgs := fs.String("guest-args", "", "more arguments for the guest's command line, such as vfio_uml.eager_dma=1")
-	guestSetup := fs.String("guest-setup", "", "shell commands to run in the guest once it boots")
 	perfJob := fs.String("perf", "", "profile the device CPU with perf during the jobs whose names contain this string")
 	jobs := fs.String("jobs", "", "run only the jobs whose names contain this string")
 	opts := bench.AddFlags(fs, 5, 1)
 	fs.Parse(args)
 	targets := fs.Args()
-	if len(targets) == 0 {
-		targets = netBenchTargets
-	}
 	for _, t := range targets {
 		if !slices.Contains(netBenchTargets, t) {
 			fs.Usage()
 			os.Exit(2)
 		}
 	}
+	if slices.Contains(targets, "guest") && len(targets) > 1 {
+		return errors.New("the guest target needs port 0 enabled and the native targets need it disabled, so run them separately")
+	}
 	if err := opts.Check(); err != nil {
 		return err
 	}
 	requireRoot()
 
-	s := &netBenchSuite{build: *build, seconds: *seconds, omit: *omit, mtu: *mtu, mem: *mem, opts: opts,
-		guestArgs: strings.Fields(*guestArgs), guestSetup: *guestSetup, perfJob: *perfJob}
+	s := &netBenchSuite{seconds: *seconds, omit: *omit, mtu: *mtu, opts: opts, perfJob: *perfJob}
 	for _, j := range netBenchJobs {
 		if strings.Contains(j.Name, *jobs) {
 			s.jobs = append(s.jobs, j)
 		}
 	}
 	var err error
+	if len(targets) == 0 {
+		t, err := defaultTarget(netGuestPort, "guest", "native")
+		if err != nil {
+			return err
+		}
+		targets = []string{t}
+		if t == "native" {
+			targets = append(targets, "native-1q")
+		}
+	}
+	if err := harness.Modprobe("i40e"); err != nil {
+		return err
+	}
+	if targets[0] == "guest" {
+		if s.enabled, err = harness.FindEnabled(netGuestPort); err != nil {
+			return err
+		}
+		if err := s.enabled.CheckDeviceCPU(opts.DeviceCPU); err != nil {
+			return err
+		}
+	} else if err := checkNative(netGuestPort); err != nil {
+		return err
+	}
 	if s.out, err = filepath.Abs(*out); err != nil {
 		return err
 	}
@@ -188,7 +202,7 @@ Jobs:`+netBenchJobList())
 	if err := harness.TeeOutput(filepath.Join(s.out, "bench.log")); err != nil {
 		return err
 	}
-	tools := []string{"iperf3", "netperf", "netserver", "ethtool", "vdpa", "ping", "taskset"}
+	tools := []string{"iperf3", "netperf", "netserver", "ethtool", "ping", "taskset"}
 	if s.perfJob != "" {
 		tools = append(tools, "perf")
 	}
@@ -197,16 +211,6 @@ Jobs:`+netBenchJobList())
 			return fmt.Errorf("%s is not installed", tool)
 		}
 	}
-	if err := harness.Modprobe("vduse", "vdpa", "virtio_vdpa", "virtio_net", "vfio-pci", "i40e"); err != nil {
-		return err
-	}
-	if vdpa.Exists(netBenchName) {
-		return fmt.Errorf("/dev/vduse/%s exists, perhaps from an earlier run, so remove it first", netBenchName)
-	}
-	if pids := harness.PCIHolders(netGuestPort); len(pids) > 0 {
-		return fmt.Errorf("%s is in use by process %d, stop its guest first", netGuestPort, pids[0])
-	}
-	s.portDriver = harness.PCIDriver(netGuestPort)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
@@ -230,6 +234,9 @@ Jobs:`+netBenchJobList())
 				return errors.New("stopped by a signal")
 			}
 			fmt.Printf("== round %d: %s\n", round, name)
+			// A run that was killed leaves the interface in the
+			// namespace, which deleting it gives back.
+			harness.Run("ip", "netns", "del", netBenchNS)
 			in := bench.Instance{Target: name, Round: round}
 			if name == "guest" {
 				err = s.runGuest(&in)
@@ -274,10 +281,9 @@ func (s *netBenchSuite) env() map[string]string {
 	env["time"] = strconv.Itoa(s.seconds)
 	env["omit"] = strconv.Itoa(s.omit)
 	env["mtu"] = strconv.Itoa(s.mtu)
-	env["mem"] = s.mem
-	env["guest_build"] = s.build
-	env["guest_args"] = strings.Join(s.guestArgs, " ")
-	env["guest_setup"] = s.guestSetup
+	if s.enabled != nil {
+		s.enabled.Describe(env)
+	}
 	env["perf"] = s.perfJob
 	env["iperf3"] = strings.SplitN(harness.Run("iperf3", "--version").Stdout, "\n", 2)[0]
 	env["netperf"] = strings.TrimSpace(harness.Run("netperf", "-V").Stdout)
@@ -285,8 +291,17 @@ func (s *netBenchSuite) env() map[string]string {
 	return env
 }
 
-// report writes the reports of the profiles, once every guest has exited.
+// report writes the reports of the profiles, unless a guest runs, whose
+// symbols perf finds only once it has exited.
 func (s *netBenchSuite) report() {
+	if len(s.profiles) == 0 {
+		return
+	}
+	if s.enabled != nil {
+		fmt.Printf("Write the profiles' reports once %s is disabled with: invirtio-test bench-perf-report %s\n",
+			s.enabled.Name, s.out)
+		return
+	}
 	for _, p := range s.profiles {
 		if err := p.Report(); err != nil {
 			fmt.Println("warning:", err)
@@ -295,10 +310,8 @@ func (s *netBenchSuite) report() {
 }
 
 func (s *netBenchSuite) cleanup() {
-	harness.Cleanup(netBenchName)
 	harness.Run("ip", "netns", "del", netBenchNS)
 	s.far.stop()
-	netRestorePort(s.portDriver)
 }
 
 // carrierIn waits for an interface in a namespace to have carrier.
@@ -319,14 +332,22 @@ func netInfo(ns, net string) map[string]string {
 
 var ethtoolCombinedRE = regexp.MustCompile(`(?s)Current hardware settings:.*?Combined:\s*(\d+)`)
 
-// enterNS moves an interface into netBenchNS and brings it up with the
-// host's address, and returns a function that moves it back and removes
-// the namespace.
+// enterNS takes an interface from NetworkManager, moves it into netBenchNS
+// and brings it up with the host's address, and returns a function that
+// moves it back with its MTU, gives it back to NetworkManager if it had it,
+// and removes the namespace.
 func (s *netBenchSuite) enterNS(net string) (func(), error) {
 	harness.Run("ip", "netns", "del", netBenchNS)
+	mtu := harness.Read(filepath.Join("/sys/class/net", net, "mtu"))
+	managed := harness.Managed(net)
+	harness.Release(net)
 	leave := func() {
 		harness.RunArgv(harness.InNS(netBenchNS, "ip", "link", "set", net, "netns", "1"))
 		harness.Run("ip", "netns", "del", netBenchNS)
+		harness.Run("ip", "link", "set", net, "mtu", mtu)
+		if managed {
+			harness.Run("nmcli", "device", "set", net, "managed", "yes")
+		}
 	}
 	for _, argv := range [][]string{
 		{"ip", "netns", "add", netBenchNS},
@@ -342,18 +363,14 @@ func (s *netBenchSuite) enterNS(net string) (func(), error) {
 	return leave, nil
 }
 
-// runNative runs the jobs with port 0 on a fresh binding of the host's
-// i40e, in netBenchNS. With oneQueue, the port has one queue pair, and its
-// interrupts go to the device CPU, as the guest's do.
+// runNative runs the jobs with port 0 on the host's i40e, in netBenchNS.
+// With oneQueue, the port has one queue pair, and its interrupts go to the
+// device CPU, as the guest's do.
 func (s *netBenchSuite) runNative(in *bench.Instance, oneQueue bool) error {
-	if err := pci.BindNative(netGuestPort); err != nil {
-		return err
-	}
 	port := harness.WaitNetdev(netGuestPort, 10*time.Second)
 	if port == "" {
 		return fmt.Errorf("%s has no interface on the host", netGuestPort)
 	}
-	harness.Release(port)
 	leave, err := s.enterNS(port)
 	if err != nil {
 		return err
@@ -391,71 +408,30 @@ func (s *netBenchSuite) runNative(in *bench.Instance, oneQueue bool) error {
 	return s.runJobs(in, netBenchNS)
 }
 
-// runGuest runs the jobs through a guest that drives port 0 and exports it.
+// runGuest runs the jobs through the interface of port 0's guest.
 func (s *netBenchSuite) runGuest(in *bench.Instance) error {
-	if net := harness.PCINetdev(netGuestPort); net != "" {
-		harness.Release(net)
-	}
-	logDir, err := harness.MakeLogDir(netBenchName)
-	if err != nil {
+	e := s.enabled
+	// A guest that failed since the last round fails this one.
+	if _, err := harness.FindEnabled(e.Device.Address); err != nil {
 		return err
 	}
-	defer os.RemoveAll(logDir)
-	// The guest runs in a cgroup of its own, as invirtio's guests do, which
-	// records its peak memory and its CPU time.
-	cg, err := harness.MakeCgroup(netBenchName)
-	if err != nil {
-		return err
-	}
-	defer harness.RemoveCgroup(cg)
-	l := harness.Launch{
-		Build:   s.build,
-		Type:    "net",
-		Name:    netBenchName,
-		Options: fmt.Sprintf("netdev=eth0,mtu=%d", s.mtu),
-		LogDir:  logDir,
-		Devices: []string{netGuestPort},
-		Args:    append([]string{"mem=" + s.mem}, s.guestArgs...),
-		Cgroup:  cg,
-		IRQCPUs: s.opts.DeviceCPU,
-	}
-	if s.opts.DeviceCPU != "" {
-		l.Args = append(l.Args, "cpu_pin="+s.opts.DeviceCPU)
-	}
-	g, err := harness.LaunchGuest(filepath.Join(s.out, fmt.Sprintf("guest-%d.log", in.Round)), l)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		harness.Detach(netBenchName, !g.Running())
-		g.Stop(30 * time.Second)
-		g.Kill()
-		harness.Cleanup(netBenchName)
-		s.guest, s.cgroup, s.memory = nil, "", nil
-	}()
-	if !g.WaitFor(netBenchName+": created", 2*time.Minute) {
-		return errors.New("the guest did not create its device, see " + g.Path)
-	}
-	if err := harness.Attach(netBenchName); err != nil {
-		return err
-	}
-	var net string
+	// An interface that a killed run left in the namespace comes back a
+	// moment after the namespace is deleted.
+	var nets []string
 	harness.Wait(func() bool {
-		nets := harness.VirtioNetdevs(netBenchName)
-		if len(nets) > 0 {
-			net = nets[0]
-		}
-		return net != ""
-	}, 30*time.Second, 100*time.Millisecond)
-	if net == "" {
-		return errors.New("the host got no interface")
+		nets = harness.VirtioNetdevs(e.Name)
+		return len(nets) > 0
+	}, 10*time.Second, 100*time.Millisecond)
+	if len(nets) == 0 {
+		return errors.New("the host has no interface for " + e.Name)
 	}
-	harness.Release(net)
+	net := nets[0]
 	cpu := -1
 	if s.opts.DeviceCPU != "" {
 		cpu, _ = strconv.Atoi(s.opts.DeviceCPU)
 	}
-	if err := harness.PlaceIRQs(netBenchName, cpu); err != nil {
+	defer harness.SaveIRQs(e.Name)()
+	if err := harness.PlaceIRQs(e.Name, cpu); err != nil {
 		return err
 	}
 	leave, err := s.enterNS(net)
@@ -466,30 +442,17 @@ func (s *netBenchSuite) runGuest(in *bench.Instance) error {
 	if !carrierIn(netBenchNS, net) {
 		return fmt.Errorf("%s has no carrier", net)
 	}
-	if !strings.Contains(g.Output("echo shell-ready", 30*time.Second), "shell-ready") {
-		return errors.New("the guest's shell does not answer, see " + g.Path)
-	}
-	if s.guestSetup != "" {
-		const done = "guest-setup-done"
-		// A subshell takes commands that end in a separator.
-		out := g.Output("("+s.guestSetup+"); echo "+done, time.Minute)
-		if !strings.Contains(out, done) {
-			return errors.New("the guest setup did not finish, see " + g.Path)
-		}
-		fmt.Print(strings.Replace(out, done+"\n", "", 1))
-	}
 	in.Info = netInfo(netBenchNS, net)
-	s.guest, s.cgroup = g, cg
-	s.memory = &harness.GuestMemory{Mem: s.mem}
-	s.memory.SampleGuest(g.Output("cat /proc/meminfo", 10*time.Second))
+	s.guest = e
+	defer func() { s.guest, s.memory = nil, nil }()
+	s.memory = &harness.GuestMemory{Mem: e.Device.GuestMemory()}
+	s.memory.SampleGuest(e.Proc("meminfo"))
+	start := guestCounters(e, nil)
 	if err := s.runJobs(in, netBenchNS); err != nil {
 		return err
 	}
-	in.Counters = g.Counters()
-	for k, v := range g.DMACounters() {
-		in.Counters["dma_"+k] = v
-	}
-	if err := s.memory.ReadCgroup(cg); err != nil {
+	in.Counters = guestCounters(e, start)
+	if err := s.memory.ReadCgroup(e.Cgroup); err != nil {
 		return err
 	}
 	in.Memory = s.memory
@@ -499,7 +462,8 @@ func (s *netBenchSuite) runGuest(in *bench.Instance) error {
 
 // guestCPU returns the busy and total ticks of the guest's CPU.
 func (s *netBenchSuite) guestCPU() (int64, int64) {
-	return harness.ParseCPULine(strings.TrimSpace(s.guest.Output("head -1 /proc/stat", 10*time.Second)))
+	line, _, _ := strings.Cut(s.guest.Proc("stat"), "\n")
+	return harness.ParseCPULine(strings.TrimSpace(line))
 }
 
 // runJobs runs each job -reps times from the namespace ns, with the CPU
@@ -531,7 +495,11 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 				}
 			}
 			start := time.Now()
-			meter := bench.StartMeter(s.opts.Sets(), s.cgroup)
+			var cgroup string
+			if s.guest != nil {
+				cgroup = s.guest.Cgroup
+			}
+			meter := bench.StartMeter(s.opts.Sets(), cgroup)
 			m, err := j.run(s, ns)
 			cpu := meter.Stop()
 			elapsed := time.Since(start)
@@ -555,7 +523,7 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 				for k, v := range bench.DMARates(dma0, s.guest.DMACounters(), elapsed) {
 					m[k] = v
 				}
-				s.memory.SampleGuest(s.guest.Output("cat /proc/meminfo", 10*time.Second))
+				s.memory.SampleGuest(s.guest.Proc("meminfo"))
 			}
 			fmt.Printf("  %s %d: %s\n", j.Name, rep, bench.Format(j.Job, m))
 			s.results.Runs = append(s.results.Runs, bench.Run{Job: j.Name, Target: in.Target, Round: in.Round, Rep: rep, Metrics: m})
@@ -694,5 +662,31 @@ Print the summary of a bench-net run from its results.json.`)
 		return err
 	}
 	fmt.Print(r.Summary(netBenchJobDefs()))
+	return nil
+}
+
+func cmdBenchPerfReport(args []string) error {
+	fs := newFlags("bench-perf-report", `
+usage: invirtio-test bench-perf-report <output dir>
+
+Write the reports of each perf profile of a bench-net run, perf-*.data, by
+symbol in .data.txt and by command and object in .data.dso.txt. Perf finds
+the symbols of a guest only once it has exited, so run this once the
+device is disabled.`)
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		fs.Usage()
+		os.Exit(2)
+	}
+	files, _ := filepath.Glob(filepath.Join(fs.Arg(0), "perf-*.data"))
+	if len(files) == 0 {
+		return fmt.Errorf("%s has no perf profiles", fs.Arg(0))
+	}
+	for _, f := range files {
+		if err := bench.Report(f); err != nil {
+			return err
+		}
+		fmt.Println(f + ".txt")
+	}
 	return nil
 }

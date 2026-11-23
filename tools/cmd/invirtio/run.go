@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"invirtio/internal/command"
+	"invirtio/internal/record"
 	"invirtio/internal/sysfs"
 	"invirtio/internal/vdpa"
 )
@@ -33,7 +34,7 @@ const attachTimeout = 120 * time.Second
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: invirtio run <name>\n\nRun the guest of an enabled device in the foreground and attach its device\nto the host. The service invirtio@<name> runs this.")
+		fmt.Fprintln(os.Stderr, "usage: invirtio run <name>\n\nRun the guest of an enabled device in the foreground and attach its device\nto the host. The transient service invirtio@<name> that enable starts runs\nthis.")
 	}
 	fs.Parse(args)
 	if fs.NArg() != 1 {
@@ -42,11 +43,7 @@ func cmdRun(args []string) error {
 	}
 	requireRoot()
 	name := fs.Arg(0)
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	dev, err := cfg.device(name)
+	dev, err := record.Load(name)
 	if err != nil {
 		return err
 	}
@@ -69,7 +66,7 @@ func modules(typ string) []string {
 	return mods
 }
 
-func guestArgs(name string, dev *Device, cgroup string) []string {
+func guestArgs(name string, dev *record.Device, cgroup string) []string {
 	kernel, initrd, _ := guestFiles(dev.Type)
 	device := dev.Address
 	if dev.ROM != "" {
@@ -80,13 +77,12 @@ func guestArgs(name string, dev *Device, cgroup string) []string {
 	}
 	args := []string{
 		"-u", guestUser, "-b", "-d", device, "-i", initrd,
-		"-s", mconsolePath(name), "-t", "30",
+		"-s", record.MconsolePath(name), "-t", "30",
 		"-e", fmt.Sprintf("%s,%s,log=%s", dev.Type, name, logPath(name)),
 	}
-	// A GPU's guest pins the BOs that the GPU reaches in system memory.
-	if dev.Type == "gpu" {
-		args = append(args, "-l", "1024")
-	}
+	// A guest with vfio_uml.eager_dma=1 pins all of its RAM, and a GPU's
+	// guest pins the BOs that the GPU reaches in system memory.
+	args = append(args, "-l", strconv.FormatInt(dev.MemlockMiB(), 10))
 	if cgroup != "" {
 		args = append(args, "-g", cgroup)
 	}
@@ -97,11 +93,11 @@ func guestArgs(name string, dev *Device, cgroup string) []string {
 	for _, opt := range dev.Options {
 		backend += "," + opt
 	}
-	args = append(args, kernel, "mem="+dev.memory(), backend)
+	args = append(args, kernel, "mem="+dev.GuestMemory(), backend)
 	return append(args, dev.Args...)
 }
 
-func supervise(name string, dev *Device) error {
+func supervise(name string, dev *record.Device) error {
 	// The launcher's parent-death signal follows the thread that started
 	// it, so that thread stays with this goroutine.
 	runtime.LockOSThread()
@@ -116,10 +112,7 @@ func supervise(name string, dev *Device) error {
 	if err := command.Run("modprobe", append([]string{"-a"}, modules(dev.Type)...)...); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(runDir, 0700); err != nil {
-		return err
-	}
-	if err := os.Chmod(runDir, 0700); err != nil {
+	if err := record.MakeDirs(); err != nil {
 		return err
 	}
 	lock, err := lockDevice(name)
@@ -314,8 +307,7 @@ wait:
 	// stop only once this service has stopped. The device stays on the bus,
 	// and a transient unit switches the display manager back to the host's
 	// driver, which removes it.
-	_, switched := os.Stat(guestDropinPath(name))
-	if !stopping && dev.Type == "gpu" && switched == nil {
+	if !stopping && dev.Type == "gpu" && displaySwitched(name) {
 		logf("switching the display manager back from %s", name)
 		if err := command.Run("systemd-run", "--no-block", "--collect", "--quiet",
 			"--unit=invirtio-display-"+name, binPath, "display", "off", name); err != nil {
@@ -349,7 +341,7 @@ func lockDevice(name string) (*os.File, error) {
 	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("another invirtio run has %s, is invirtio@%s running?", name, name)
+		return nil, fmt.Errorf("another invirtio run has %s, is %s running?", name, record.Unit(name))
 	}
 	return f, nil
 }
@@ -598,7 +590,7 @@ var errNotService = errors.New("invirtio run is not running as the service")
 // guest pins. systemd starts the supervisor in the subgroup supervisor, so
 // that the service's cgroup holds no processes and can enable controllers
 // for its children. A host without swap accounting has no memory.swap.max.
-func setupCgroup(name string, dev *Device) (string, error) {
+func setupCgroup(name string, dev *record.Device) (string, error) {
 	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
 		return "", err
@@ -609,11 +601,11 @@ func setupCgroup(name string, dev *Device) (string, error) {
 			rel = p
 		}
 	}
-	if !strings.HasSuffix(rel, "/invirtio@"+name+".service/supervisor") {
+	if !strings.HasSuffix(rel, "/"+record.Unit(name)+"/supervisor") {
 		return "", errNotService
 	}
 	base := filepath.Join("/sys/fs/cgroup", filepath.Dir(rel))
-	limit, err := dev.memoryMax()
+	limit, err := dev.CgroupLimit()
 	if err != nil {
 		return "", err
 	}

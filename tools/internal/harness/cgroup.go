@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // GuestMemory is the memory that a guest took: what its cgroup was charged,
@@ -25,31 +24,6 @@ type GuestMemory struct {
 	// use, which is MemTotal less MemAvailable.
 	GuestTotalBytes    int64 `json:"guest_total_bytes"`
 	GuestPeakUsedBytes int64 `json:"guest_peak_used_bytes"`
-}
-
-// MakeCgroup makes a cgroup for a guest below the root of the cgroup v2
-// hierarchy, in place of one that an earlier run left, and returns its
-// directory.
-func MakeCgroup(name string) (string, error) {
-	dir := filepath.Join("/sys/fs/cgroup", name)
-	RemoveCgroup(dir)
-	if err := os.Mkdir(dir, 0755); err != nil {
-		return "", err
-	}
-	if !Exists(filepath.Join(dir, "memory.peak")) {
-		os.Remove(dir)
-		return "", fmt.Errorf("the cgroup %s has no memory.peak, so the memory controller is off", dir)
-	}
-	return dir, nil
-}
-
-// RemoveCgroup removes a cgroup once its processes are gone, which can take
-// a moment after a guest exits.
-func RemoveCgroup(dir string) {
-	if !Exists(dir) {
-		return
-	}
-	Wait(func() bool { return os.Remove(dir) == nil || !Exists(dir) }, 10*time.Second, 100*time.Millisecond)
 }
 
 // ParseKeyed parses lines of a name and a number, as memory.stat and

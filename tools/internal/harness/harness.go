@@ -478,11 +478,6 @@ func ParseSection(text, section string) map[string]int64 {
 	return counters
 }
 
-// DMACounters returns the guest's VFIO DMA counters, read in its shell.
-func (g *Guest) DMACounters() map[string]int64 {
-	return ParseSection(g.Output("cat /proc/vfio_uml", 10*time.Second), "dma")
-}
-
 // Signal sends a signal to the guest's first process.
 func (g *Guest) Signal(sig syscall.Signal) error {
 	return g.cmd.Process.Signal(sig)

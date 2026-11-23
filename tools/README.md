@@ -39,37 +39,41 @@ Enter before it runs them. With `-n`, they print every stage and change
 nothing, which needs no root, and with `-y`, they do not wait.
 
 - `install` copies the guest, its initramfs, the launcher and `invirtio`
-  to `/usr/lib/invirtio` and `/usr/local/sbin`, adds the `invirtio` user
-  that the guests run as, and installs the service `invirtio@.service`.
+  to `/usr/lib/invirtio` and `/usr/local/sbin`, and adds the `invirtio`
+  user that the guests run as. It also removes the service, udev rule and
+  `/etc/invirtio/devices.json` of earlier versions, and refuses to run
+  while that list names a device, which the installed `invirtio disable`
+  of the earlier version must disable first.
 - `enable` checks that the guest has a driver for the device, records it
-  in `/etc/invirtio/devices.json`, adds a udev rule that keeps the host's
-  driver from taking it at boot, and starts `invirtio@<name>`, now and at
-  every boot. The name defaults to the type and the address, such as
-  `wlan-06-00-0`. Enabling a device that is already recorded finishes
-  enabling it, after an earlier `enable` that stopped partway.
+  in `/run/invirtio/devices/<name>.json`, and starts the transient service
+  `invirtio@<name>`. The name defaults to the type and the address, such
+  as `wlan-06-00-0`. The device stays in its guest until it is disabled or
+  the host reboots, and nothing starts at boot. The guest's settings are
+  options of `enable`: `-memory` (the guest's `mem=`), `-memory-max` (the
+  guest cgroup's limit), `-options` for the backend's
+  `vduse_guest.device=` argument, `-args` for the guest's command line,
+  and `-irq-cpus` for the launcher's `-a`. Changing them means disabling
+  the device and enabling it again.
 - `disable` stops the guest, removes what a failed guest left on the host,
   gives the device back to its host driver, and removes the device's
-  record and udev rule.
+  record. It also cleans up after an `enable` that failed.
 - `list` shows the host's WiFi and Ethernet devices, with the host driver
   that has each now, the guest driver that would drive it, and the name it
   is enabled as.
-- `status` shows each device's service, its host and guest drivers, its
-  VDUSE and vDPA state and its host interface. With `-v`, it adds the
-  guest's VDUSE counters.
+- `status` shows each device's service and guest settings, its host and
+  guest drivers, its VDUSE and vDPA state and its host interface. With
+  `-v`, it adds the guest's memory in detail, and with `-vv`, also its
+  VDUSE counters.
 - `console` attaches to the guest's console, with the last 64 KiB of its
   output, and Ctrl-] detaches. Escape sequences that carry strings, C1
   controls and invalid UTF-8 are dropped from the guest's output, which
   assumes a terminal in UTF-8, as the console sets it when it attaches.
 
-`devices.json` also takes, for each device, `memory` (the guest's `mem=`),
-`memory_max` (the guest cgroup's limit in bytes), `options` for the
-backend's `vduse_guest.device=` argument, `args` for the guest's command
-line, and `irq_cpus` for the launcher's `-a`. A change takes effect when
-the service restarts.
-
 ## The service
 
-`invirtio@<name>` runs `invirtio run <name>`, which:
+`enable` starts `invirtio@<name>` with `systemd-run`, which waits until the
+device is on the host, so `enable` fails if the guest does not get that
+far. The service runs `invirtio run <name>`, which:
 
 1. loads the host modules, and removes a wlan device that an earlier guest
    left on the vDPA bus, since a new guest cannot take one over;
@@ -87,9 +91,10 @@ the service restarts.
    host's reset, then stops the guest.
 
 When a guest exits by itself, a wlan device is removed, and a net device
-stays on the bus for the next guest to reconnect to. systemd then starts
-the service again. If the service is stopped before it restarts, or gives
-up restarting, the net device stays on the bus with no guest, which
-`status` shows, and `disable` removes it. The host's next message to such a
-device waits for VDUSE's 30 s timeout, after which VDUSE treats the device
-as broken until it is removed.
+stays on the bus, where a guest that `systemctl start invirtio@<name>`
+starts again reconnects to it. systemd does not restart the service by
+itself, and it stays failed until the device is disabled or started again,
+so a guest that crashes during a benchmark is not hidden. `status` shows a
+net device left on the bus with no guest, and `disable` removes it. The
+host's next message to such a device waits for VDUSE's 30 s timeout, after
+which VDUSE treats the device as broken until it is removed.

@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 
 	"invirtio/internal/pci"
+	"invirtio/internal/record"
 	"invirtio/internal/sysfs"
 )
 
@@ -30,7 +31,7 @@ func cmdList(args []string) error {
 		return err
 	}
 	sort.Strings(paths)
-	cfg, err := loadConfig()
+	devs, err := record.All()
 	if err != nil {
 		return err
 	}
@@ -68,8 +69,10 @@ func cmdList(args []string) error {
 			}
 		}
 		enabled := "-"
-		if n, _, err := cfg.lookup(addr); err == nil {
-			enabled = n
+		for n, d := range devs {
+			if d.Address == addr {
+				enabled = n
+			}
 		}
 		name := names[addr]
 		if name == "" {

@@ -44,21 +44,22 @@ state out of the drivers' reach (`docs/MPK.md`). That guest goes to
 sudo build/invirtio install -guest linux-uml/build-invirtio
 ```
 
-This installs the guest, the launcher and `invirtio` itself, and the
-service that runs each device's guest. Add `-n` to see the commands it
-would run without running them.
+This installs the guest, the launcher and `invirtio` itself. Add `-n` to
+see the commands it would run without running them.
 
 ## Using a device
 
 `invirtio list` shows the host's WiFi, Ethernet and display devices, their
 current drivers, and whether the guest can drive them. To move a WiFi or
-Ethernet device into a guest, now and at every boot:
+Ethernet device into a guest:
 
 ```
 sudo invirtio enable 06:00.0
 ```
 
-The host then sees a `virtio_wlan` or `virtio_net` interface in place of
+The device stays in its guest until it is disabled or the host reboots,
+and every boot starts with each device on its host driver. The host then
+sees a `virtio_wlan` or `virtio_net` interface in place of
 the device, which NetworkManager can use as usual.
 
 ```
@@ -77,7 +78,10 @@ guests, `invirtio status` shows:
 
 ```
 gpu-01-00-0 (gpu, 0000:01:00.0)
-  service:         active, disabled
+  service:         active
+  guest:           mem=2G
+  backend options: display
+  guest arguments: drm_kms_helper.fbdev_emulation=0
   host driver:     vfio-pci
   guest driver:    amdgpu
   VDUSE device:    created, on the vDPA bus
@@ -85,7 +89,8 @@ gpu-01-00-0 (gpu, 0000:01:00.0)
   memory:          133M, peak 162M, limit 2.50G
 
 net-05-00-0 (net, 0000:05:00.0)
-  service:         active, enabled
+  service:         active
+  guest:           mem=256M
   host driver:     vfio-pci
   guest driver:    i40e
   VDUSE device:    created, on the vDPA bus
@@ -93,7 +98,8 @@ net-05-00-0 (net, 0000:05:00.0)
   memory:          21M, peak 26M, limit 768M
 
 wlan-06-00-0 (wlan, 0000:06:00.0)
-  service:         active, enabled
+  service:         active
+  guest:           mem=256M
   host driver:     vfio-pci
   guest driver:    mt7921e
   VDUSE device:    created, on the vDPA bus
@@ -138,15 +144,15 @@ sudo invirtio enable -rom vbios.rom 0000:01:00.0
 An APU keeps its VBIOS in the host's ACPI tables, which the guest cannot
 read, so `-rom` gives the guest an image of it that was dumped on the
 host. The switch stops the display manager, moves the GPU to `vfio-pci`,
-starts the guest as `invirtio@gpu-01-00-0`, and starts the display manager
-again once the guest's DRM card is on the host. Graphical sessions take
+starts the guest as `invirtio@gpu-01-00-0`, and once the guest's DRM card
+is on the host, starts the display manager again. Graphical sessions take
 `/opt/invirtio/mesa` meanwhile. If the display manager does not start, the
 GPU goes back to its host driver. The switch logs to
 `journalctl -u invirtio-display-gpu-01-00-0`.
 
-The switch lasts until the next boot, which always starts on the GPU's host
-driver. To switch back without a reboot, again from a text console or a
-remote login:
+As with other devices, the switch lasts until the GPU is disabled or the
+host reboots. To switch back without a reboot, again from a text console or
+a remote login:
 
 ```
 sudo invirtio disable gpu-01-00-0

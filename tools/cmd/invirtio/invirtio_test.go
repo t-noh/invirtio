@@ -13,26 +13,8 @@ import (
 	"golang.org/x/term"
 
 	"invirtio/internal/pci"
+	"invirtio/internal/record"
 )
-
-func TestParseSize(t *testing.T) {
-	good := map[string]int64{
-		"768M": 768 << 20,
-		"1G":   1 << 30,
-		"64k":  64 << 10,
-		"4096": 4096,
-	}
-	for s, want := range good {
-		if got, err := parseSize(s); err != nil || got != want {
-			t.Errorf("parseSize(%q) = %d, %v, want %d", s, got, err, want)
-		}
-	}
-	for _, s := range []string{"", "M", "-1G", "1.5G", "1GB", "0", "12x", "99999999999G"} {
-		if _, err := parseSize(s); err == nil {
-			t.Errorf("parseSize(%q) succeeded", s)
-		}
-	}
-}
 
 func TestNames(t *testing.T) {
 	if got := defaultName("wlan", "0000:06:00.0"); got != "wlan-06-00-0" {
@@ -40,17 +22,6 @@ func TestNames(t *testing.T) {
 	}
 	if got := defaultName("net", "0001:05:00.1"); got != "net-0001-05-00-1" {
 		t.Errorf("defaultName = %q", got)
-	}
-	for _, name := range []string{"wlan-06-00-0", "net0", "a"} {
-		if err := checkName(name); err != nil {
-			t.Errorf("checkName(%q): %v", name, err)
-		}
-	}
-	for _, name := range []string{"", "control", "invirtio", "-x", "Wlan", "a/b", "a.b", "a,b",
-		strings.Repeat("a", 33)} {
-		if checkName(name) == nil {
-			t.Errorf("checkName(%q) succeeded", name)
-		}
 	}
 }
 
@@ -140,12 +111,12 @@ func TestLineLogger(t *testing.T) {
 }
 
 func TestGuestArgs(t *testing.T) {
-	dev := &Device{Address: "0000:06:00.0", Type: "wlan", Options: []string{"poll=50"},
+	dev := &record.Device{Address: "0000:06:00.0", Type: "wlan", Options: []string{"poll=50"},
 		Args: []string{"loglevel=4"}}
 	got := strings.Join(guestArgs("wlan-06-00-0", dev, "/sys/fs/cgroup/x/guest"), " ")
 	want := "-u invirtio -b -d 0000:06:00.0 -i /usr/lib/invirtio/initramfs.cpio " +
 		"-s /run/invirtio/wlan-06-00-0.mconsole -t 30 " +
-		"-e wlan,wlan-06-00-0,log=/run/invirtio/wlan-06-00-0/inflight " +
+		"-e wlan,wlan-06-00-0,log=/run/invirtio/wlan-06-00-0/inflight -l 1024 " +
 		"-g /sys/fs/cgroup/x/guest /usr/lib/invirtio/linux mem=256M " +
 		"vduse_guest.device=wlan,wlan-06-00-0,poll=50 loglevel=4"
 	if got != want {
@@ -154,27 +125,16 @@ func TestGuestArgs(t *testing.T) {
 }
 
 func TestGuestArgsGPU(t *testing.T) {
-	dev := &Device{Address: "0000:01:00.0", Type: "gpu", ROM: "/etc/invirtio/gpu-01-00-0.rom",
+	dev := &record.Device{Address: "0000:01:00.0", Type: "gpu", ROM: "/run/invirtio/gpu-01-00-0.rom",
 		WCBars: "0x1", Options: []string{"display"}, Args: []string{"drm_kms_helper.fbdev_emulation=0"}}
 	got := strings.Join(guestArgs("gpu-01-00-0", dev, ""), " ")
-	want := "-u invirtio -b -d 0000:01:00.0,rom=/etc/invirtio/gpu-01-00-0.rom,wc_bars=0x1 " +
+	want := "-u invirtio -b -d 0000:01:00.0,rom=/run/invirtio/gpu-01-00-0.rom,wc_bars=0x1 " +
 		"-i /usr/lib/invirtio/initramfs-gpu.cpio -s /run/invirtio/gpu-01-00-0.mconsole -t 30 " +
-		"-e gpu,gpu-01-00-0,log=/run/invirtio/gpu-01-00-0/inflight -l 1024 " +
+		"-e gpu,gpu-01-00-0,log=/run/invirtio/gpu-01-00-0/inflight -l 2304 " +
 		"/usr/lib/invirtio/linux-gpu mem=2G vduse_guest.device=gpu,gpu-01-00-0,display " +
 		"drm_kms_helper.fbdev_emulation=0"
 	if got != want {
 		t.Errorf("guestArgs =\n%s\nwant\n%s", got, want)
-	}
-}
-
-func TestUdevSkipsGPUs(t *testing.T) {
-	cfg := &Config{Devices: map[string]*Device{
-		"gpu-01-00-0": {Address: "0000:01:00.0", Type: "gpu"},
-		"net-05-00-0": {Address: "0000:05:00.0", Type: "net"},
-	}}
-	show := udevActions(cfg)[0].show
-	if strings.Contains(show, "0000:01:00.0") || !strings.Contains(show, "0000:05:00.0") {
-		t.Errorf("the udev rule should keep only the NIC from its host driver:\n%s", show)
 	}
 }
 
@@ -262,20 +222,7 @@ func TestConsoleServer(t *testing.T) {
 }
 
 func TestDisableDryRun(t *testing.T) {
-	wlan := &Device{Address: "0000:06:00.0", Type: "wlan"}
-	cfg := &Config{Devices: map[string]*Device{
-		"net-05-00-0":  {Address: "0000:05:00.0", Type: "net"},
-		"wlan-06-00-0": wlan,
-	}}
-	stages, err := disablePlan(cfg, "wlan-06-00-0", wlan)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(stages[0].actions[0].show, "0000:05:00.0") ||
-		strings.Contains(stages[0].actions[0].show, "0000:06:00.0") {
-		t.Errorf("the first stage writes the rules\n%s", stages[0].actions[0].show)
-	}
-
+	stages := disablePlan("wlan-06-00-0", &record.Device{Address: "0000:06:00.0", Type: "wlan"})
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -292,16 +239,27 @@ func TestDisableDryRun(t *testing.T) {
 	out.ReadFrom(r)
 	t.Log("\n" + out.String())
 	for _, want := range []string{
-		"$ systemctl disable --now invirtio@wlan-06-00-0.service",
+		"$ systemctl stop invirtio@wlan-06-00-0.service",
+		"$ systemctl reset-failed invirtio@wlan-06-00-0.service",
 		"$ echo 1 > /sys/class/vduse/wlan-06-00-0/msg_timeout",
 		"$ vdpa dev del wlan-06-00-0",
 		"$ echo > /sys/bus/pci/devices/0000:06:00.0/driver_override",
 		"$ echo 0000:06:00.0 > /sys/bus/pci/devices/0000:06:00.0/driver/unbind",
-		`KERNEL=="0000:05:00.0", ATTR{driver_override}="vfio-pci"`,
+		"$ rm -f /run/invirtio/devices/wlan-06-00-0.json",
 		"This was a dry run",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("the dry run lacks %q", want)
+		}
+	}
+}
+
+func TestStartArgs(t *testing.T) {
+	got := strings.Join(startArgs("net-05-00-0", "net"), " ")
+	for _, want := range []string{"--unit=invirtio@net-05-00-0.service", "-p Type=notify",
+		"-p KillMode=mixed", "-p DelegateSubgroup=supervisor", "/usr/local/sbin/invirtio run net-05-00-0"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("startArgs lacks %q:\n%s", want, got)
 		}
 	}
 }

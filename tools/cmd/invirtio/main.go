@@ -5,16 +5,18 @@
 //
 //	invirtio install [-n] [-y] -guest <build dir> [-initramfs <file>] [-launcher <file>] [-gpu-guest <build dir>]
 //	invirtio uninstall [-n] [-y]
-//	invirtio enable [-n] [-y] [-name <name>] [-memory <size>] [-rom <file>] [-mesa <prefix>] <pci address>
+//	invirtio enable [-n] [-y] [-name <name>] [-memory <size>] [-memory-max <size>] [-options <list>]
+//	                [-args <args>] [-irq-cpus <cpus>] [-rom <file>] [-mesa <prefix>] <pci address>
 //	invirtio disable [-n] [-y] <name | pci address>
 //	invirtio list
-//	invirtio status [-v] [<name>]
+//	invirtio status [-v | -vv] [<name>]
 //	invirtio console <name>
 //	invirtio run <name>
 //	invirtio display on|off <name>
 //
-// Each enabled device runs in a guest of its own, as the systemd service
-// invirtio@<name>, which runs "invirtio run <name>".
+// Each enabled device runs in a guest of its own, as the transient systemd
+// service invirtio@<name>, which runs "invirtio run <name>" until the device
+// is disabled or the host reboots.
 package main
 
 import (
@@ -29,9 +31,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage: invirtio <command> [arguments]
 
 Commands:
-  install    install the guest, the launcher and this tool, and the service
+  install    install the guest, the launcher and this tool
   uninstall  disable every device and remove what install added
-  enable     run a device's driver in a guest and export it to the host
+  enable     run a device's driver in a guest and export it to the host,
+             until it is disabled or the host reboots
   disable    stop a device's guest and return the device to its host driver
   list       list the host's WiFi, Ethernet and display devices and their drivers
   status     show the state of the devices

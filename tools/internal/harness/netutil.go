@@ -25,6 +25,12 @@ var systemSupplicant = []string{"busctl", "--auto-start=no", "call", "fi.w1.wpa_
 
 var supplicantPathRE = regexp.MustCompile(`^o "(\S+)"`)
 
+// Managed reports whether NetworkManager manages an interface.
+func Managed(net string) bool {
+	r := Run("nmcli", "-g", "GENERAL.STATE", "device", "show", net)
+	return r.OK() && !strings.Contains(r.Stdout, "unmanaged")
+}
+
 // Release takes an interface from NetworkManager and the system
 // wpa_supplicant, which would otherwise configure it or end connections that
 // they did not make. NetworkManager can still be handing the interface to

@@ -11,30 +11,8 @@ import (
 	"path/filepath"
 
 	"invirtio/internal/command"
+	"invirtio/internal/record"
 )
-
-// The service runs one device's guest. KillMode=mixed sends the stop signal
-// to the supervisor alone, which removes the device and stops the guest in
-// order. Delegate lets the supervisor give the guest a cgroup of its own,
-// and DelegateSubgroup starts the supervisor in a subgroup beside it. A stop
-// can wait for VDUSE's message timeout and then for the launcher's, so
-// TimeoutStopSec leaves room for both.
-const unitText = `[Unit]
-Description=InvirtIO driver guest for %i
-After=systemd-udevd.service systemd-modules-load.service
-
-[Service]
-ExecStart=` + binPath + ` run %i
-Restart=on-failure
-RestartSec=2
-KillMode=mixed
-TimeoutStopSec=120
-Delegate=yes
-DelegateSubgroup=supervisor
-
-[Install]
-WantedBy=multi-user.target
-`
 
 func cmdInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
@@ -45,7 +23,7 @@ func cmdInstall(args []string) error {
 	dry := fs.Bool("n", false, "show the commands of each stage without running them")
 	yes := fs.Bool("y", false, "run each stage without waiting for Enter")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: invirtio install [-n] [-y] -guest <build dir> [-initramfs <file>] [-launcher <file>] [-gpu-guest <build dir>]\n\nInstall the guest, the launcher, this program and the service, and with\n-gpu-guest the guest of GPUs. Each stage shows its commands and waits for\nEnter before it runs them. Running guests keep the old guest until they\nrestart.")
+		fmt.Fprintln(os.Stderr, "usage: invirtio install [-n] [-y] -guest <build dir> [-initramfs <file>] [-launcher <file>] [-gpu-guest <build dir>]\n\nInstall the guest, the launcher and this program, and with -gpu-guest the\nguest of GPUs. Each stage shows its commands and waits for Enter before it\nruns them. Running guests keep the old guest until they are disabled and\nenabled again.")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
@@ -108,21 +86,15 @@ func cmdInstall(args []string) error {
 			"--user-group", guestUser))
 	}
 
-	var configs []action
-	if _, err := os.Stat(configPath); err != nil {
-		configs = append(configs, mkdirAction(configDir, 0755),
-			writeAction(configPath, emptyConfig, 0644))
+	if err := checkLegacyDevices(); err != nil {
+		return err
 	}
 
 	stages := []stage{
 		{title: "check that the host can run guests", actions: hostChecks()},
 		{title: "copy the guest, the launcher and invirtio", actions: copies},
 		{title: "add the user " + guestUser + ", which the guests run as", actions: users},
-		{title: "install the service", actions: []action{
-			writeAction(unitPath, unitText, 0644),
-			cmdAction("systemctl", "daemon-reload"),
-		}},
-		{title: "create the device list", actions: configs},
+		{title: "remove what earlier versions installed", actions: legacyActions()},
 	}
 	if err := runStages(stages, *dry, *yes); err != nil {
 		return err
@@ -132,22 +104,17 @@ func cmdInstall(args []string) error {
 	}
 
 	fmt.Println("\nInstalled InvirtIO. Enable a device with: invirtio enable <pci address>")
-	cfg, err := loadConfig()
+	devs, err := record.All()
 	if err != nil {
 		return err
 	}
-	for _, name := range cfg.names() {
-		if systemctlState("is-active", "invirtio@"+name+".service") == "active" {
-			fmt.Printf("The guest of %s runs the old version until: systemctl restart invirtio@%s\n", name, name)
+	for _, name := range record.Names(devs) {
+		if systemctlState("is-active", record.Unit(name)) == "active" {
+			fmt.Printf("The guest of %s runs the old version until it is disabled and enabled again.\n", name)
 		}
 	}
 	return nil
 }
-
-const emptyConfig = `{
-  "devices": {}
-}
-`
 
 // hostChecks checks that the host kernel can run guests. A missing
 // virtio_wlan or cgroup v2 hierarchy limits what guests can do, and only

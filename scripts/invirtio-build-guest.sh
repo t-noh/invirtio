@@ -5,7 +5,6 @@
 #                 drivers and VDUSE backends of the WiFi and Ethernet
 #                 guests, and the WiFi firmware. invirtio picks the backend
 #                 for each device when it starts the device's guest.
-#                 invirtio-test bench-net and bench-wlan run it.
 #   blk-test      the guest that invirtio-test test-blk runs under the
 #                 launcher, which serves a ramdisk.
 #   blk-test-ubd  the guest that invirtio-test test-blk runs without the

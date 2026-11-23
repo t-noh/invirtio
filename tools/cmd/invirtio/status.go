@@ -9,8 +9,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"invirtio/internal/mconsole"
 	"invirtio/internal/pci"
+	"invirtio/internal/record"
 	"invirtio/internal/sysfs"
 	"invirtio/internal/vdpa"
 )
@@ -32,14 +32,14 @@ func cmdStatus(args []string) error {
 	if _, err := os.Stat(guestPath); err != nil {
 		fmt.Println("InvirtIO is not installed.")
 	}
-	cfg, err := loadConfig()
+	devs, err := record.All()
 	if err != nil {
 		return err
 	}
-	names := cfg.names()
+	names := record.Names(devs)
 	if fs.NArg() == 1 {
-		if _, err := cfg.device(fs.Arg(0)); err != nil {
-			return err
+		if _, ok := devs[fs.Arg(0)]; !ok {
+			return fmt.Errorf("no device %s is enabled", fs.Arg(0))
 		}
 		names = []string{fs.Arg(0)}
 	}
@@ -57,9 +57,15 @@ func cmdStatus(args []string) error {
 		} else if *verbose {
 			level = 1
 		}
-		showDevice(name, cfg.Devices[name], level)
+		showDevice(name, devs[name], level)
 	}
 	return nil
+}
+
+// systemctlShow returns a property of a unit.
+func systemctlShow(unit, prop string) string {
+	out, _ := exec.Command("systemctl", "show", "-p", prop, "--value", unit).Output()
+	return strings.TrimSpace(string(out))
 }
 
 func systemctlState(verb, unit string) string {
@@ -72,15 +78,26 @@ func systemctlState(verb, unit string) string {
 
 // showDevice shows a device's state, and with a level of 1 the guest's
 // memory in detail, and with 2 its VDUSE counters too.
-func showDevice(name string, dev *Device, level int) {
-	unit := "invirtio@" + name + ".service"
+func showDevice(name string, dev *record.Device, level int) {
+	unit := record.Unit(name)
 	row := func(label, value string) {
 		fmt.Printf("  %-16s %s\n", label+":", value)
 	}
 
 	fmt.Printf("%s (%s, %s)\n", name, dev.Type, dev.Address)
 	active := systemctlState("is-active", unit)
-	row("service", active+", "+systemctlState("is-enabled", unit))
+	row("service", active)
+	settings := "mem=" + dev.GuestMemory()
+	if dev.IRQCPUs != "" {
+		settings += ", interrupts on CPUs " + dev.IRQCPUs
+	}
+	row("guest", settings)
+	if len(dev.Options) > 0 {
+		row("backend options", strings.Join(dev.Options, ","))
+	}
+	if len(dev.Args) > 0 {
+		row("guest arguments", strings.Join(dev.Args, " "))
+	}
 	host := pci.Driver(dev.Address)
 	if host == "" {
 		host = "none"
@@ -97,8 +114,8 @@ func showDevice(name string, dev *Device, level int) {
 	if vdpa.Exists(name) {
 		state = "created"
 		if vdpa.Attached(name) && active != "active" && active != "activating" {
-			// A net device stays on the bus for the next guest, which does
-			// not come when the service stopped before restarting.
+			// A net device stays on the bus for the next guest after its
+			// guest exits.
 			state += ", on the vDPA bus with no guest, invirtio disable removes it"
 		} else if vdpa.Attached(name) {
 			state += ", on the vDPA bus"
@@ -120,7 +137,7 @@ func showDevice(name string, dev *Device, level int) {
 		row("host interface", fmt.Sprintf("%s (%s)", n, oper))
 	}
 
-	cg := guestCgroup(unit)
+	cg := record.GuestCgroup(name)
 	if cg == "" {
 		row("memory", "no guest runs")
 	} else {
@@ -140,13 +157,13 @@ func showDevice(name string, dev *Device, level int) {
 	}
 	// The guest writes its memory figures, its counters and any error, so
 	// only printable text of theirs reaches the terminal.
-	if meminfo, err := mconsole.Request(mconsolePath(name), "proc meminfo"); err == nil {
+	if meminfo, err := record.Proc(name, "meminfo"); err == nil {
 		row("guest memory", printable(guestMemory(meminfo)))
 	}
 	if level < 2 {
 		return
 	}
-	text, err := mconsole.Request(mconsolePath(name), "proc vduse_guest")
+	text, err := record.Proc(name, "vduse_guest")
 	if err != nil {
 		row("guest counters", printable(fmt.Sprintf("not available: %v", err)))
 		return

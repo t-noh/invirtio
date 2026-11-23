@@ -69,23 +69,28 @@ func (p *Profile) Stop() error {
 	return os.Chmod(p.data, 0644)
 }
 
-// Report writes two reports of the recording, by symbol in <data>.txt and
-// by command and object in <data>.dso.txt, which any user can read. Perf
-// looks a process's files up in its mount namespace while the process runs,
-// so a guest's symbols only resolve once the guest has exited.
+// Report writes the reports of the recording, as the function Report does.
 func (p *Profile) Report() error {
+	return Report(p.data)
+}
+
+// Report writes two reports of a recording, by symbol in <data>.txt and by
+// command and object in <data>.dso.txt, which any user can read. Perf looks
+// a process's files up in its mount namespace while the process runs, so a
+// guest's symbols only resolve once the guest has exited.
+func Report(data string) error {
 	for _, r := range []struct {
 		file string
 		args []string
 	}{
-		{p.data + ".txt", []string{"--sort", "dso,sym"}},
-		{p.data + ".dso.txt", []string{"--sort", "comm,dso", "-g", "none"}},
+		{data + ".txt", []string{"--sort", "dso,sym"}},
+		{data + ".dso.txt", []string{"--sort", "comm,dso", "-g", "none"}},
 	} {
 		f, err := os.Create(r.file)
 		if err != nil {
 			return err
 		}
-		args := append([]string{"report", "-i", p.data, "--stdio", "--no-children",
+		args := append([]string{"report", "-i", data, "--stdio", "--no-children",
 			"--percent-limit", "0.5"}, r.args...)
 		cmd := exec.Command("perf", args...)
 		cmd.Stdout, cmd.Stderr = f, f

@@ -4,28 +4,12 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"invirtio/internal/sysfs"
 )
-
-// guestCgroup returns the cgroup that the supervisor gave the guest of a
-// running service, or "".
-func guestCgroup(unit string) string {
-	out, err := exec.Command("systemctl", "show", "-p", "ControlGroup", "--value", unit).Output()
-	rel := strings.TrimSpace(string(out))
-	if err != nil || rel == "" {
-		return ""
-	}
-	dir := filepath.Join("/sys/fs/cgroup", rel, "guest")
-	if _, err := os.Stat(filepath.Join(dir, "memory.current")); err != nil {
-		return ""
-	}
-	return dir
-}
 
 // formatSize formats a size in bytes with the largest unit of K, M and G
 // in which it rounds to one or more.

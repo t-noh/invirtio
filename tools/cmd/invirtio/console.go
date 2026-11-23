@@ -17,6 +17,8 @@ import (
 
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
+
+	"invirtio/internal/record"
 )
 
 // The client detaches when it reads Ctrl-].
@@ -362,13 +364,13 @@ func cmdConsole(args []string) error {
 	}
 	requireRoot()
 	name := fs.Arg(0)
-	if err := checkName(name); err != nil {
+	if err := record.CheckName(name); err != nil {
 		return err
 	}
 
 	conn, err := net.Dial("unix", consolePath(name))
 	if err != nil {
-		return fmt.Errorf("cannot reach the console of %s, is invirtio@%s running? %v", name, name, err)
+		return fmt.Errorf("cannot reach the console of %s, is %s running? %v", name, record.Unit(name), err)
 	}
 	defer conn.Close()
 
