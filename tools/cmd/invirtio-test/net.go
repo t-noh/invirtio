@@ -642,8 +642,10 @@ func netTestStop(s *netSuite) {
 type netFarEnd struct {
 	net     string
 	servers []*exec.Cmd
-	// linkDownOnClose is i40e's flag before the test, which it restores.
+	// linkDownOnClose is i40e's flag before the test, and mtu the port's
+	// MTU, which it restores.
 	linkDownOnClose string
+	mtu             string
 	// restoreIRQs restores the affinity of port 1's interrupts, or is nil.
 	restoreIRQs func()
 }
@@ -662,6 +664,7 @@ func netStartPeer(addr string, mtu int, cpus string, servers ...string) (*netFar
 	if f.net == "" {
 		return nil, fmt.Errorf("%s has no interface on the host", netPeerPort)
 	}
+	f.mtu = harness.Read(filepath.Join("/sys/class/net", f.net, "mtu"))
 	m := linkDownOnCloseRE.FindStringSubmatch(harness.Run("ethtool", "--show-priv-flags", f.net).Stdout)
 	if m == nil {
 		return nil, fmt.Errorf("ethtool shows no link-down-on-close flag for %s", f.net)
@@ -728,4 +731,5 @@ func (f *netFarEnd) stop() {
 	harness.Run("ip", "netns", "del", netPeerNS)
 	harness.Wait(func() bool { return harness.PCINetdev(netPeerPort) != "" }, 10*time.Second, 100*time.Millisecond)
 	harness.Run("ethtool", "--set-priv-flags", f.net, "link-down-on-close", f.linkDownOnClose)
+	harness.Run("ip", "link", "set", f.net, "mtu", f.mtu)
 }
