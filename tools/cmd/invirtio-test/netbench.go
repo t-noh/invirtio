@@ -53,8 +53,8 @@ var netBenchJobs = []netBenchJob{
 	{bench.Job{Name: "paced-rx-2.5g", About: "TCP from the far end, one stream paced at 2.5 Gb/s", Metrics: []string{"gbps", "retransmits"}}, netBenchPacedTCP(true, "2500M"), true},
 	{bench.Job{Name: "udp64-tx", About: "64-byte UDP datagrams to the far end at an unlimited rate", Metrics: []string{"sent_kpps", "received_kpps", "loss_pct"}}, netBenchUDP(false), true},
 	{bench.Job{Name: "udp64-rx", About: "64-byte UDP datagrams from the far end at an unlimited rate", Metrics: []string{"sent_kpps", "received_kpps", "loss_pct"}}, netBenchUDP(true), true},
-	{bench.Job{Name: "tcp-rr", About: "netperf TCP_RR with 1-byte messages", Metrics: []string{"tps", "mean_us", "p99_us"}}, netBenchRR("TCP_RR"), false},
-	{bench.Job{Name: "udp-rr", About: "netperf UDP_RR with 1-byte messages", Metrics: []string{"tps", "mean_us", "p99_us"}}, netBenchRR("UDP_RR"), false},
+	{bench.Job{Name: "tcp-rr", About: "netperf TCP_RR with 1-byte messages", Metrics: []string{"tps", "mean_us", "p50_us", "p99_us"}}, netBenchRR("TCP_RR"), true},
+	{bench.Job{Name: "udp-rr", About: "netperf UDP_RR with 1-byte messages", Metrics: []string{"tps", "mean_us", "p50_us", "p99_us"}}, netBenchRR("UDP_RR"), true},
 	{bench.Job{Name: "ping-idle", About: "ping round trips on an idle link", Metrics: []string{"avg_us", "max_us", "mdev_us"}}, netBenchPing(false), false},
 	{bench.Job{Name: "ping-load", About: "ping round trips during a TCP stream", Metrics: []string{"avg_us", "max_us", "mdev_us"}}, netBenchPing(true), false},
 }
@@ -109,7 +109,8 @@ once and runs its jobs -reps times, and every other round runs the targets
 in the reverse order. Both ports have an MTU of -mtu, and the guest's
 backend takes one up to its mtu= option, which enable's -options sets. Each
 throughput job runs for -time seconds after -omit seconds that it leaves
-out.
+out, and each request/response job runs netperf for -omit seconds before
+the -time seconds that it measures.
 
 The benchmark's programs run on -app-cpus, and the far end's programs and
 port 1's interrupts on -peer-cpus. With native-1q and the guest, the
@@ -128,7 +129,7 @@ the most memory that the guest itself used between jobs. Each round's
 VDUSE and DMA counters count from the guest's start, with their values at
 the start of the round under start_. With -perf, perf records the device
 CPU, or every CPU without pinning, during each run of the matching jobs,
-after the omitted seconds of iperf3, into
+after the omitted seconds, into
 perf-<job>-<target>-<round>-<rep>.data in the output directory. Its
 messages go to .data.log. Reports by symbol go to .data.txt and by command
 and object to .data.dso.txt, at the end of a native run, and for the
@@ -141,8 +142,8 @@ on the linux-host kernel, with iperf3, netperf and ethtool, and perf for
 
 Jobs:`+netBenchJobList())
 	out := fs.String("out", filepath.Join(root, "build/bench-net"), "the output directory")
-	seconds := fs.Int("time", 10, "the seconds that each throughput job measures")
-	omit := fs.Int("omit", 2, "the seconds at the start of each iperf3 run that it leaves out")
+	seconds := fs.Int("time", 10, "the seconds that each throughput and request/response job measures")
+	omit := fs.Int("omit", 2, "the seconds at the start of each throughput job, and before each request/response job, that it leaves out")
 	mtu := fs.Int("mtu", 1500, "the MTU of both ports")
 	perfJob := fs.String("perf", "", "profile the device CPU with perf during the jobs whose names contain this string")
 	jobs := fs.String("jobs", "", "run only the jobs whose names contain this string")
@@ -597,11 +598,26 @@ func netBenchUDP(reverse bool) func(*netBenchSuite, string) (map[string]float64,
 	}
 }
 
+// netperfRRKeys are the metrics of netperfRROutput's selectors, in order.
+var netperfRRKeys = []string{"tps", "mean_us", "p50_us", "p99_us"}
+
+const netperfRROutput = "THROUGHPUT,MEAN_LATENCY,P50_LATENCY,P99_LATENCY"
+
+// netBenchRR runs netperf for the -omit seconds of warm-up, whose results
+// it drops, and then for the -time seconds that it measures.
 func netBenchRR(test string) func(*netBenchSuite, string) (map[string]float64, error) {
 	return func(s *netBenchSuite, ns string) (map[string]float64, error) {
-		r := s.run(ns, time.Duration(s.seconds+60)*time.Second, "netperf", "-H", netPeerAddr, "-t", test,
-			"-l", fmt.Sprint(s.seconds), "-P", "0", "--", "-r", "1,1", "-o", "THROUGHPUT,MEAN_LATENCY,P99_LATENCY")
-		return parseNetperf(r.Stdout, r.Output())
+		rr := func(seconds int) (map[string]float64, error) {
+			r := s.run(ns, time.Duration(seconds+60)*time.Second, "netperf", "-H", netPeerAddr, "-t", test,
+				"-l", fmt.Sprint(seconds), "-P", "0", "--", "-r", "1,1", "-o", netperfRROutput)
+			return parseNetperf(r.Stdout, r.Output())
+		}
+		if s.omit > 0 {
+			if _, err := rr(s.omit); err != nil {
+				return nil, fmt.Errorf("warm-up: %v", err)
+			}
+		}
+		return rr(s.seconds)
 	}
 }
 
@@ -609,17 +625,18 @@ func netBenchRR(test string) func(*netBenchSuite, string) (map[string]float64, e
 func parseNetperf(stdout, all string) (map[string]float64, error) {
 	lines := strings.Split(strings.TrimSpace(stdout), "\n")
 	f := strings.Split(lines[len(lines)-1], ",")
-	if len(f) != 3 {
+	if len(f) != len(netperfRRKeys) {
 		return nil, fmt.Errorf("netperf printed %q", strings.TrimSpace(all))
 	}
-	var v [3]float64
-	for i := range f {
-		var err error
-		if v[i], err = strconv.ParseFloat(strings.TrimSpace(f[i]), 64); err != nil {
+	m := map[string]float64{}
+	for i, k := range netperfRRKeys {
+		v, err := strconv.ParseFloat(strings.TrimSpace(f[i]), 64)
+		if err != nil {
 			return nil, fmt.Errorf("netperf printed %q", strings.TrimSpace(all))
 		}
+		m[k] = v
 	}
-	return map[string]float64{"tps": v[0], "mean_us": v[1], "p99_us": v[2]}, nil
+	return m, nil
 }
 
 func netBenchPing(load bool) func(*netBenchSuite, string) (map[string]float64, error) {
