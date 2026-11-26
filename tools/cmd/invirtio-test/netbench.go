@@ -112,7 +112,8 @@ in the reverse order. Both ports have an MTU of -mtu, and the guest's
 backend takes one up to its mtu= option, which enable's -options sets. Each
 throughput job runs for -time seconds after -omit seconds that it leaves
 out, and each request/response job runs netperf for -omit seconds before
-the -time seconds that it measures.
+the -time seconds that it measures. The CPU use and the other measurements
+of a run leave the omitted seconds out too.
 
 The benchmark's programs run on -app-cpus, and the far end's programs and
 port 1's interrupts on -peer-cpus. With native-1q and the guest, the
@@ -482,22 +483,13 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 			if s.ctx.Err() != nil {
 				return errors.New("stopped by a signal")
 			}
-			var gbusy0, gtotal0 int64
-			var dma0 map[string]int64
-			var vcpu int
-			var sched0 harness.Sched
-			if s.guest != nil {
-				dma0 = s.guest.DMACounters()
-				gbusy0, gtotal0 = s.guestCPU()
-				vcpu = s.guest.VCPUThread()
-			}
 			var prof *bench.Profile
+			var delay time.Duration
+			if j.omits {
+				delay = time.Duration(s.omit) * time.Second
+			}
 			if s.perfJob != "" && strings.Contains(j.Name, s.perfJob) {
 				data := filepath.Join(s.out, fmt.Sprintf("perf-%s-%s-%d-%d.data", j.Name, in.Target, in.Round, rep))
-				var delay time.Duration
-				if j.omits {
-					delay = time.Duration(s.omit) * time.Second
-				}
 				var err error
 				prof, err = bench.StartProfile(s.ctx, s.opts.DeviceCPU, data, delay,
 					time.Duration(s.seconds+60)*time.Second)
@@ -505,25 +497,63 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 					return fmt.Errorf("%s: %v", j.Name, err)
 				}
 			}
-			var counter *bench.Counter
-			if s.count {
-				out := filepath.Join(s.out, fmt.Sprintf("perf-stat-%s-%s-%d-%d.csv", j.Name, in.Target, in.Round, rep))
-				var err error
-				if counter, err = bench.StartCounter(s.ctx, s.opts.Sets(), out); err != nil {
-					return fmt.Errorf("%s: %v", j.Name, err)
+			type result struct {
+				m   map[string]float64
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				m, err := j.run(s, ns)
+				done <- result{m, err}
+			}()
+			// Every measurement covers what the job reports, which leaves out
+			// its first -omit seconds, so the readings start after them. The
+			// guest's own counters, which its mconsole serves on the device
+			// CPU, are read a second earlier, within the warm-up.
+			early := max(delay-time.Second, 0)
+			waits := []time.Duration{early, delay - early}
+			var gbusy0, gtotal0 int64
+			var dma0 map[string]int64
+			var vcpu int
+			var cgroup string
+			var gstart time.Time
+			for i, wait := range waits {
+				select {
+				case r := <-done:
+					if prof != nil {
+						prof.Stop()
+					}
+					if r.err == nil {
+						r.err = errors.New("it ended within its warm-up")
+					}
+					return fmt.Errorf("%s: %v", j.Name, r.err)
+				case <-time.After(wait):
+				}
+				if i == 0 && s.guest != nil {
+					gstart = time.Now()
+					dma0 = s.guest.DMACounters()
+					gbusy0, gtotal0 = s.guestCPU()
+					vcpu = s.guest.VCPUThread()
+					cgroup = s.guest.Cgroup
 				}
 			}
-			sched0 = harness.SchedStats(vcpu)
-			start := time.Now()
-			var cgroup string
-			if s.guest != nil {
-				cgroup = s.guest.Cgroup
+			var counter *bench.Counter
+			var cerr error
+			if s.count {
+				out := filepath.Join(s.out, fmt.Sprintf("perf-stat-%s-%s-%d-%d.csv", j.Name, in.Target, in.Round, rep))
+				counter, cerr = bench.StartCounter(s.ctx, s.opts.Sets(), out)
 			}
+			sched0 := harness.SchedStats(vcpu)
+			start := time.Now()
 			meter := bench.StartMeter(s.opts.Sets(), cgroup)
-			m, err := j.run(s, ns)
+			r := <-done
+			m, err := r.m, r.err
 			cpu := meter.Stop()
 			sched1 := harness.SchedStats(vcpu)
 			elapsed := time.Since(start)
+			if cerr != nil && err == nil {
+				err = cerr
+			}
 			if counter != nil {
 				cycles, cerr := counter.Stop(elapsed)
 				if cerr != nil && err == nil {
@@ -550,7 +580,7 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 				if gtotal1 > gtotal0 && gtotal0 > 0 {
 					m["guest_busy"] = float64(gbusy1-gbusy0) / float64(gtotal1-gtotal0)
 				}
-				for k, v := range bench.DMARates(dma0, s.guest.DMACounters(), elapsed) {
+				for k, v := range bench.DMARates(dma0, s.guest.DMACounters(), time.Since(gstart)) {
 					m[k] = v
 				}
 				for k, v := range bench.SchedRates(sched0, sched1, elapsed) {
