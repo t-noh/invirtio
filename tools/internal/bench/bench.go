@@ -196,10 +196,11 @@ func FormatValue(v float64) string {
 }
 
 // Format describes a run's metrics in one line, the job's metrics first and
-// then its CPU use and the guest's DMA mappings.
+// then its CPU use, the scheduling of the guest's CPU thread and the guest's
+// DMA mappings.
 func Format(j Job, m map[string]float64) string {
 	var parts []string
-	keys := append(append([]string(nil), j.Metrics...), CPUKeys...)
+	keys := append(append(append(append([]string(nil), j.Metrics...), CPUKeys...), CycleKeys...), SchedKeys...)
 	for _, k := range append(keys, DMAKeys...) {
 		if v, ok := m[k]; ok {
 			parts = append(parts, k+" "+FormatValue(v))
@@ -333,18 +334,24 @@ func (r *Results) Summary(jobs []Job) string {
 		}
 		b.WriteString(table(rows))
 		b.WriteString(r.means(j.Name, targets, "cpu", CPUKeys))
+		b.WriteString(r.means(j.Name, targets, "cycles", CycleKeys))
+		b.WriteString(r.means(j.Name, targets, "sched", SchedKeys))
 		b.WriteString(r.means(j.Name, targets, "dma", DMAKeys))
 		b.WriteString("\n")
 	}
 	b.WriteString("Each value is the mean over the rounds of each round's mean, with the\n" +
 		"half-width of its 95% confidence interval and its ratio to the first\n" +
 		"target. cpu_host is how many of the host's CPUs were busy, and cpu_app,\n" +
-		"cpu_device and cpu_peer how many of the CPUs of each set. cpu_guest is\n" +
-		"how many CPUs the guest's cgroup took, and guest_busy how busy the\n" +
-		"guest's own CPU was. dma_maps_per_s is how many buffers the guest\n" +
-		"mapped into the host's IOMMU each second, dma_cached_per_s how many a\n" +
-		"cached mapping served, and dma_premapped_per_s how many the eagerly\n" +
-		"mapped RAM served.\n")
+		"cpu_device, cpu_aux and cpu_peer how many of the CPUs of each set.\n" +
+		"cpu_guest is how many CPUs the guest's cgroup took, and guest_busy how\n" +
+		"busy the guest's own CPU was. vcpu_wait_us_per_s is how many\n" +
+		"microseconds each second the thread of the guest's CPU waited to run,\n" +
+		"and vcpu_preempts_per_s how often it was preempted. gcycles_<set> is\n" +
+		"how many billions of cycles each set's CPUs ran each second, and\n" +
+		"ipc_<set> their instructions per cycle. dma_maps_per_s is\n" +
+		"how many buffers the guest mapped into the host's IOMMU each second,\n" +
+		"dma_cached_per_s how many a cached mapping served, and\n" +
+		"dma_premapped_per_s how many the eagerly mapped RAM served.\n")
 	for _, t := range r.Targets {
 		var top *harness.GuestMemory
 		n := 0

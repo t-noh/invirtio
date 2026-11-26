@@ -65,13 +65,15 @@ type netBenchSuite struct {
 	// profiles are reported at the end of a native run.
 	perfJob  string
 	profiles []*bench.Profile
-	mtu      int
-	seconds  int
-	omit     int
-	opts     *bench.Options
-	jobs     []netBenchJob
-	far      *netFarEnd
-	results  bench.Results
+	// count is set to count each run's cycles with perf stat.
+	count   bool
+	mtu     int
+	seconds int
+	omit    int
+	opts    *bench.Options
+	jobs    []netBenchJob
+	far     *netFarEnd
+	results bench.Results
 	// enabled is port 0's guest for the guest target. guest is set to it
 	// while the target runs, and its CPU use and memory are measured.
 	enabled *harness.Enabled
@@ -146,6 +148,7 @@ Jobs:`+netBenchJobList())
 	omit := fs.Int("omit", 2, "the seconds at the start of each throughput job, and before each request/response job, that it leaves out")
 	mtu := fs.Int("mtu", 1500, "the MTU of both ports")
 	perfJob := fs.String("perf", "", "profile the device CPU with perf during the jobs whose names contain this string")
+	count := fs.Bool("count", false, "count the cycles and instructions of the CPU sets with perf stat during each run")
 	jobs := fs.String("jobs", "", "run only the jobs whose names contain this string")
 	opts := bench.AddFlags(fs, 5, 1)
 	fs.Parse(args)
@@ -164,7 +167,7 @@ Jobs:`+netBenchJobList())
 	}
 	requireRoot()
 
-	s := &netBenchSuite{seconds: *seconds, omit: *omit, mtu: *mtu, opts: opts, perfJob: *perfJob}
+	s := &netBenchSuite{seconds: *seconds, omit: *omit, mtu: *mtu, opts: opts, perfJob: *perfJob, count: *count}
 	for _, j := range netBenchJobs {
 		if strings.Contains(j.Name, *jobs) {
 			s.jobs = append(s.jobs, j)
@@ -204,8 +207,11 @@ Jobs:`+netBenchJobList())
 		return err
 	}
 	tools := []string{"iperf3", "netperf", "netserver", "ethtool", "ping", "taskset"}
-	if s.perfJob != "" {
+	if s.perfJob != "" || s.count {
 		tools = append(tools, "perf")
+	}
+	if s.count && len(opts.Sets()) == 0 {
+		return errors.New("-count needs pinned CPUs")
 	}
 	for _, tool := range tools {
 		if harness.Run("sh", "-c", "command -v "+tool).Code != 0 {
@@ -286,6 +292,7 @@ func (s *netBenchSuite) env() map[string]string {
 		s.enabled.Describe(env)
 	}
 	env["perf"] = s.perfJob
+	env["count"] = strconv.FormatBool(s.count)
 	env["iperf3"] = strings.SplitN(harness.Run("iperf3", "--version").Stdout, "\n", 2)[0]
 	env["netperf"] = strings.TrimSpace(harness.Run("netperf", "-V").Stdout)
 	env["nic"] = strings.TrimSpace(harness.Run("lspci", "-s", netGuestPort).Stdout)
@@ -477,9 +484,12 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 			}
 			var gbusy0, gtotal0 int64
 			var dma0 map[string]int64
+			var vcpu int
+			var sched0 harness.Sched
 			if s.guest != nil {
 				dma0 = s.guest.DMACounters()
 				gbusy0, gtotal0 = s.guestCPU()
+				vcpu = s.guest.VCPUThread()
 			}
 			var prof *bench.Profile
 			if s.perfJob != "" && strings.Contains(j.Name, s.perfJob) {
@@ -495,6 +505,15 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 					return fmt.Errorf("%s: %v", j.Name, err)
 				}
 			}
+			var counter *bench.Counter
+			if s.count {
+				out := filepath.Join(s.out, fmt.Sprintf("perf-stat-%s-%s-%d-%d.csv", j.Name, in.Target, in.Round, rep))
+				var err error
+				if counter, err = bench.StartCounter(s.ctx, s.opts.Sets(), out); err != nil {
+					return fmt.Errorf("%s: %v", j.Name, err)
+				}
+			}
+			sched0 = harness.SchedStats(vcpu)
 			start := time.Now()
 			var cgroup string
 			if s.guest != nil {
@@ -503,7 +522,17 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 			meter := bench.StartMeter(s.opts.Sets(), cgroup)
 			m, err := j.run(s, ns)
 			cpu := meter.Stop()
+			sched1 := harness.SchedStats(vcpu)
 			elapsed := time.Since(start)
+			if counter != nil {
+				cycles, cerr := counter.Stop(elapsed)
+				if cerr != nil && err == nil {
+					err = cerr
+				}
+				for k, v := range cycles {
+					cpu[k] = v
+				}
+			}
 			if prof != nil {
 				if perr := prof.Stop(); perr != nil && err == nil {
 					err = perr
@@ -522,6 +551,9 @@ func (s *netBenchSuite) runJobs(in *bench.Instance, ns string) error {
 					m["guest_busy"] = float64(gbusy1-gbusy0) / float64(gtotal1-gtotal0)
 				}
 				for k, v := range bench.DMARates(dma0, s.guest.DMACounters(), elapsed) {
+					m[k] = v
+				}
+				for k, v := range bench.SchedRates(sched0, sched1, elapsed) {
 					m[k] = v
 				}
 				s.memory.SampleGuest(s.guest.Proc("meminfo"))

@@ -21,10 +21,13 @@ type Options struct {
 	Reps   int
 	// AppCPUs runs the benchmark's programs, DeviceCPU takes the device's
 	// interrupts and runs the guest, and PeerCPUs runs the far end's
-	// programs and takes its interrupts. They are "" without pinning.
+	// programs and takes its interrupts. AuxCPUs, if set, are CPUs whose use
+	// is recorded on their own, such as those of a guest's helper threads.
+	// They are "" without pinning.
 	AppCPUs   string
 	DeviceCPU string
 	PeerCPUs  string
+	AuxCPUs   string
 	Boost     string
 	NoTune    bool
 	noPin     bool
@@ -43,6 +46,7 @@ func AddFlags(fs *flag.FlagSet, rounds, reps int) *Options {
 	fs.StringVar(&o.AppCPUs, "app-cpus", "6-7", "the host CPUs of the benchmark's programs")
 	fs.StringVar(&o.DeviceCPU, "device-cpu", "4", "the host CPU of the device's interrupts and of the guest")
 	fs.StringVar(&o.PeerCPUs, "peer-cpus", "8-9", "the host CPUs of the far end's servers, and of its interrupts where the benchmark has them")
+	fs.StringVar(&o.AuxCPUs, "aux-cpus", "", "host CPUs whose use is recorded as cpu_aux, such as those of the guest's helper threads")
 	fs.BoolVar(&o.noPin, "no-pin", false, "leave programs, interrupts and the guest unpinned")
 	fs.StringVar(&o.Boost, "boost", "off", "the CPU boost during the run: on, off, or keep")
 	fs.BoolVar(&o.NoTune, "no-tune", false, "leave the CPU governor, boost and irqbalance as they are")
@@ -59,7 +63,7 @@ func (o *Options) Check() error {
 		return fmt.Errorf("-boost must be on, off or keep")
 	}
 	if o.noPin {
-		o.AppCPUs, o.DeviceCPU, o.PeerCPUs = "", "", ""
+		o.AppCPUs, o.DeviceCPU, o.PeerCPUs, o.AuxCPUs = "", "", "", ""
 		return nil
 	}
 	online, err := cpuList(harness.Read("/sys/devices/system/cpu/online"))
@@ -79,7 +83,10 @@ func (o *Options) Check() error {
 		return sib[0]
 	}
 	used := map[int]string{}
-	for _, s := range []struct{ name, list string }{{"app", o.AppCPUs}, {"device", o.DeviceCPU}, {"peer", o.PeerCPUs}} {
+	for _, s := range []struct{ name, list string }{{"app", o.AppCPUs}, {"device", o.DeviceCPU}, {"peer", o.PeerCPUs}, {"aux", o.AuxCPUs}} {
+		if s.name == "aux" && s.list == "" {
+			continue
+		}
 		cpus, err := cpuList(s.list)
 		if err != nil {
 			return fmt.Errorf("the %s CPUs: %v", s.name, err)
@@ -103,7 +110,7 @@ func (o *Options) Check() error {
 	}
 	var other []string
 	for _, c := range online {
-		if u := used[core(c)]; u != "app" && u != "peer" {
+		if u := used[core(c)]; u != "app" && u != "peer" && u != "aux" {
 			other = append(other, strconv.Itoa(c))
 		}
 	}
@@ -111,8 +118,8 @@ func (o *Options) Check() error {
 	return nil
 }
 
-// OtherCPUs returns the online CPUs outside the cores of the app and peer
-// sets, or "" without pinning.
+// OtherCPUs returns the online CPUs outside the cores of the app, peer and
+// aux sets, or "" without pinning.
 func (o *Options) OtherCPUs() string { return o.otherCPUs }
 
 // Sets returns the sets of CPUs whose use each run records.
@@ -121,6 +128,9 @@ func (o *Options) Sets() []Set { return o.sets }
 // Describe returns the options for the results' description of the host.
 func (o *Options) Describe() map[string]string {
 	pin := "app " + o.AppCPUs + ", device " + o.DeviceCPU + ", peer " + o.PeerCPUs
+	if o.AuxCPUs != "" {
+		pin += ", aux " + o.AuxCPUs
+	}
 	if o.noPin {
 		pin = "none"
 	}

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -102,4 +104,104 @@ func Report(data string) error {
 		os.Chmod(r.file, 0644)
 	}
 	return nil
+}
+
+// CycleKeys are the metrics of a Counter: the billions of cycles that each
+// set's CPUs ran per second of the run, and their instructions per cycle.
+var CycleKeys = []string{"gcycles_app", "gcycles_device", "gcycles_aux", "gcycles_peer", "ipc_app", "ipc_device", "ipc_aux"}
+
+// A Counter counts the cycles and instructions of the CPUs of sets of host
+// CPUs with perf stat.
+type Counter struct {
+	cmd  *exec.Cmd
+	out  string
+	sets []Set
+}
+
+// StartCounter counts the CPUs of the sets into the file out, in perf
+// stat's CSV form with a line for each CPU and event, until Stop. Perf runs
+// without a workload, so SIGINT ends its counting.
+func StartCounter(ctx context.Context, sets []Set, out string) (*Counter, error) {
+	var cpus []string
+	for _, s := range sets {
+		for _, c := range s.CPUs {
+			cpus = append(cpus, strconv.Itoa(c))
+		}
+	}
+	if len(cpus) == 0 {
+		return nil, errors.New("perf stat needs pinned CPUs")
+	}
+	cmd := exec.CommandContext(ctx, "perf", "stat", "-A", "-x,", "-e", "cycles,instructions",
+		"-C", strings.Join(cpus, ","), "-o", out)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGINT) }
+	cmd.WaitDelay = time.Minute
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &Counter{cmd: cmd, out: out, sets: sets}, nil
+}
+
+// Stop ends the counting and returns the CycleKeys metrics of the sets that
+// were counted, per second of elapsed.
+func (c *Counter) Stop(elapsed time.Duration) (map[string]float64, error) {
+	c.cmd.Process.Signal(syscall.SIGINT)
+	err := c.cmd.Wait()
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		if ws, ok := exit.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGINT {
+			err = nil
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("perf stat: %v, see %s", err, c.out)
+	}
+	data, err := os.ReadFile(c.out)
+	if err != nil {
+		return nil, err
+	}
+	counts := parsePerfStat(string(data))
+	out := map[string]float64{}
+	if elapsed <= 0 {
+		return out, nil
+	}
+	for _, s := range c.sets {
+		var cycles, insns float64
+		for _, cpu := range s.CPUs {
+			cycles += counts[cpu]["cycles"]
+			insns += counts[cpu]["instructions"]
+		}
+		out["gcycles_"+s.Name] = cycles / 1e9 / elapsed.Seconds()
+		if cycles > 0 && s.Name != "peer" {
+			out["ipc_"+s.Name] = insns / cycles
+		}
+	}
+	return out, nil
+}
+
+// parsePerfStat returns the counts of perf stat -A -x, output by CPU and
+// event. Lines are CPU<n>,<count>,<unit>,<event>,... and events that were
+// not counted have a count that is not a number.
+func parsePerfStat(text string) map[int]map[string]float64 {
+	counts := map[int]map[string]float64{}
+	for _, line := range strings.Split(text, "\n") {
+		f := strings.Split(line, ",")
+		if len(f) < 4 || !strings.HasPrefix(f[0], "CPU") {
+			continue
+		}
+		cpu, err := strconv.Atoi(f[0][3:])
+		if err != nil {
+			continue
+		}
+		n, err := strconv.ParseFloat(f[1], 64)
+		if err != nil {
+			continue
+		}
+		event, _, _ := strings.Cut(f[3], ":")
+		if counts[cpu] == nil {
+			counts[cpu] = map[string]float64{}
+		}
+		counts[cpu][event] = n
+	}
+	return counts
 }

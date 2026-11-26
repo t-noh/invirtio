@@ -30,6 +30,42 @@ func ParseCPULine(line string) (busy, total int64) {
 	return total - v[3] - v[4], total
 }
 
+// Sched is a thread's scheduling statistics. WaitNS is the time that it
+// spent runnable but waiting for a CPU, and Preempts how often it was
+// switched out while runnable. OK is false if they could not be read.
+type Sched struct {
+	WaitNS   int64
+	Preempts int64
+	OK       bool
+}
+
+// SchedStats reads the scheduling statistics of the main thread of process
+// pid from its schedstat and status files.
+func SchedStats(pid int) Sched {
+	if pid <= 0 {
+		return Sched{}
+	}
+	dir := fmt.Sprintf("/proc/%d/task/%d", pid, pid)
+	f := strings.Fields(Read(dir + "/schedstat"))
+	if len(f) < 2 {
+		return Sched{}
+	}
+	wait, err := strconv.ParseInt(f[1], 10, 64)
+	if err != nil {
+		return Sched{}
+	}
+	for _, line := range strings.Split(Read(dir+"/status"), "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok && k == "nonvoluntary_ctxt_switches" {
+			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			if err != nil {
+				return Sched{}
+			}
+			return Sched{WaitNS: wait, Preempts: n, OK: true}
+		}
+	}
+	return Sched{}
+}
+
 // Parent returns a process's parent, from /proc/<pid>/stat.
 func Parent(pid int) int {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))

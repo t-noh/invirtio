@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"invirtio/internal/record"
@@ -69,6 +70,19 @@ func (e *Enabled) Counters() map[string]int64 {
 // DMACounters returns the guest's VFIO DMA counters.
 func (e *Enabled) DMACounters() map[string]int64 {
 	return ParseSection(e.Proc("vfio_uml"), "dma")
+}
+
+// VCPUThread returns the process id of the guest's UML process, whose main
+// thread runs guest CPU 0, or 0 if the guest's cgroup has none. UML's helper
+// processes have its name too, and the UML process as their parent.
+func (e *Enabled) VCPUThread() int {
+	comm := func(pid int) string { return Read(fmt.Sprintf("/proc/%d/comm", pid)) }
+	for _, f := range strings.Fields(Read(filepath.Join(e.Cgroup, "cgroup.procs"))) {
+		if pid, err := strconv.Atoi(f); err == nil && comm(pid) == "linux" && comm(Parent(pid)) != "linux" {
+			return pid
+		}
+	}
+	return 0
 }
 
 // SaveIRQs returns a function that sets the CPUs that VDUSE injects each

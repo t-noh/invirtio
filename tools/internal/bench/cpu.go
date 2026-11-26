@@ -13,7 +13,24 @@ import (
 // CPUKeys are the metrics of a run's CPU use, in the order that summaries
 // show them. Each set of host CPUs has the key cpu_<set>, and guest_busy is
 // recorded by benchmarks that read the guest's own CPU time.
-var CPUKeys = []string{"cpu_host", "cpu_app", "cpu_device", "cpu_peer", "cpu_guest", "guest_busy"}
+var CPUKeys = []string{"cpu_host", "cpu_app", "cpu_device", "cpu_aux", "cpu_peer", "cpu_guest", "guest_busy"}
+
+// SchedKeys are the metrics of how the host scheduled the thread that runs
+// the guest's CPU: the time that it waited to run and how often it was
+// preempted, each per second of the run.
+var SchedKeys = []string{"vcpu_wait_us_per_s", "vcpu_preempts_per_s"}
+
+// SchedRates returns the SchedKeys metrics between two readings of a
+// thread's harness.SchedStats.
+func SchedRates(before, after harness.Sched, elapsed time.Duration) map[string]float64 {
+	if elapsed <= 0 || !before.OK || !after.OK {
+		return map[string]float64{}
+	}
+	return map[string]float64{
+		"vcpu_wait_us_per_s":  float64(after.WaitNS-before.WaitNS) / 1e3 / elapsed.Seconds(),
+		"vcpu_preempts_per_s": float64(after.Preempts-before.Preempts) / elapsed.Seconds(),
+	}
+}
 
 // DMAKeys are the metrics of a run's DMA mappings in the guest.
 var DMAKeys = []string{"dma_maps_per_s", "dma_cached_per_s", "dma_premapped_per_s"}

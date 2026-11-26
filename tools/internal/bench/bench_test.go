@@ -106,3 +106,16 @@ func TestDMARates(t *testing.T) {
 		t.Error("DMARates without a first reading")
 	}
 }
+
+func TestParsePerfStat(t *testing.T) {
+	text := "# started on Tue Nov 25\n\nCPU4,2500000000,,cycles,10000000000,100.00,,\n" +
+		"CPU4,1000000000,,instructions,10000000000,100.00,0.40,insn per cycle\n" +
+		"CPU6,<not counted>,,cycles,0,0.00,,\nCPU6,300,,cpu_core/cycles/,1,100.00,,\n"
+	c := parsePerfStat(text)
+	if c[4]["cycles"] != 2.5e9 || c[4]["instructions"] != 1e9 {
+		t.Errorf("CPU4 = %v", c[4])
+	}
+	if c[6]["cpu_core/cycles/"] != 300 {
+		t.Errorf("CPU6 = %v", c[6])
+	}
+}
